@@ -1,8 +1,10 @@
 
-body {
+body, html {
 	font-family: -apple-system, 'Open Sans', sans-serif;
 	background-color: #91a8d0;
 	color: snow;
+	height: 100%;
+	width: 100%;
 }
 
 .content {
@@ -42,4 +44,8 @@ body {
 .main-content ul li a {
 	color: white;
 	font-size: 11pt;
+}
+
+.main-content ul li a:hover {
+	color: lightgray;
 }
