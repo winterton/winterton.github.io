@@ -1,20 +1,76 @@
-
-//Glider
-var map = [
-    [0, 0, 1, 0, 0],
-    [0, 0, 0, 1, 0],
-    [0, 1, 1, 1, 0],
-    [0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0]
-];
-
-//TODO: Refactor, fix x/y, clean up naming
+//TODO: Refactor this!!!
 
 function insertPoint(x, y) {
     if (map[y][x] === 0) {
         map[y][x] = 1;
     } else {
         map[y][x] = 0;
+    }
+}
+
+function insertGlider(x,y) {
+    var coords = [
+        [x,y-1],
+        [x,y+1],
+        [x+1, y],
+        [x+1, y+1],
+        [x-1, y+1]
+    ];
+    insertPattern(coords);
+}
+
+function insertBlinker(x,y) {
+    var coords = [
+        [x, y],
+        [x-1, y],
+        [x+1, y]
+    ];
+    insertPattern(coords);
+}
+
+function insertSpaceship(x,y) {
+    var coords = [
+		[x-2,y],
+        [x-2, y+1],
+        [x-2,y+2],
+        [x-1,y-1],
+        [x-1,y+2],
+        [x,y+2],
+        [x+1,y+2],
+        [x+2,y+1],
+        [x+2,y-1]
+	];
+    insertPattern(coords);
+}
+
+function insertToad(x,y) {
+    var coords = [
+        [x, y],
+        [x-1, y],
+        [x+1, y],
+        [x+1, y-1],
+        [x, y-1],
+        [x+2, y-1]
+    ];
+    insertPattern(coords);
+}
+
+function insertPattern(coords) {
+    var xOffset = 1;
+    var yOffset = 1;
+
+    for (var coord in coords) {
+        if (coord[0] < 0 && Math.abs(coord[0]) > xOffset) {
+            xOffset = Math.abs(coord[0]);
+        }
+        if (coord[1] < 0 && Math.abs(coord[1]) > yOffset) {
+            yOffset = Math.abs(coord[1]);
+        }
+    }
+
+    for (var i = 0; i < coords.length; ++i) {
+        var c = coords[i];
+        insertPoint(c[0] + xOffset, c[1] + yOffset);
     }
 }
 
@@ -49,7 +105,7 @@ function generation() {
                 if (neighbors < 2) newGeneration[x][y] = 0;
                 if (neighbors === 2 || neighbors === 3) newGeneration[x][y] = 1;
                 if (neighbors > 3) newGeneration[x][y] = 0;
-            } else if (neighbors == 3) {
+            } else if (neighbors === 3) {
                 newGeneration[x][y] = 1;
             }
         }
@@ -66,16 +122,19 @@ function printMap() {
 }
 
 function startGame(numGenerations) {
-    // generateMap();
-    //printMap();
-    for (var i = 0; i < numGenerations; i++) {
-        setTimeout(tick, 100 * i);
+    if (numGenerations > 0) {
+        for (var i = 0; i < numGenerations; i++) {
+            setTimeout(tick, 100 * i);
+        }
+    } else {
+        //go forever
+        window.setInterval(tick, 100);
     }
 }
 
+
 function tick() {
     generation();
-    printMap();
     drawGame();
 }
 
@@ -99,7 +158,7 @@ function drawGame() {
     canvas.height = window.innerHeight;
 
 
-    context.fillStyle = '#FFF';
+    context.fillStyle = 'rgba(0,0,0,0)';
     context.fillRect(0,0,canvas.width, canvas.height);
 
     var xPixelSize = 20;
@@ -110,9 +169,9 @@ function drawGame() {
         var xOffset = 0;
         for (var x = 0; x < map[y].length; ++x) {
             if (map[y][x] === 1) {
-                context.fillStyle = '#000';
+                context.fillStyle = 'rgba(0,0,0,.5)';
             } else {
-                context.fillStyle = '#F00';
+                context.fillStyle = 'rgba(0,0,0,0)';
             }
             context.fillRect(x + xOffset, y + yOffset, xPixelSize, yPixelSize);
 
@@ -122,16 +181,37 @@ function drawGame() {
     }
 }
 
+function getRandomIndex(min, max) {
+    return Math.floor(Math.random() * (max - min) + min);
+}
+
 document.addEventListener("DOMContentLoaded", function(){
     generateMap();
-    map[10][10] = 1;
-    map[11][11] = 1;
-    map[12][10] = 1;
-    map[12][11] = 1;
-    map[12][9] = 1;
     drawGame();
+    startGame();
 });
 
-document.getElementById('canvas').addEventListener('click', function(e){
-    //TODO: Handle click events.
+document.addEventListener('click', function(e){
+    var x = Math.floor(e.clientX / 20);
+    var y = Math.floor(e.clientY / 20);
+
+
+    var rand = getRandomIndex(0,4);
+    console.log(rand);
+    switch (rand) {
+        case 0:
+            insertToad(x,y);
+            break;
+        case 1:
+            insertGlider(x,y);
+            break;
+        case 2:
+            insertBlinker(x,y);
+            break;
+        case 3:
+            insertSpaceship(x,y);
+            break;
+    }
+    drawGame();
+
 });

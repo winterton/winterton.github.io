@@ -1,10 +1,13 @@
 
 body, html {
 	font-family: -apple-system, 'Open Sans', sans-serif;
-	background-color: #91a8d0;
 	color: snow;
 	height: 100%;
 	width: 100%;
+}
+
+html {
+	background-color: #91a8d0;
 }
 
 .content {
@@ -13,13 +16,23 @@ body, html {
 	align-items: center;
 	height: 100%;
 	width: 100%;
+	z-index: 1000;
+}
+
+#canvas {
+	z-index: -1;
+	position: absolute;
+	left: 0;
+	top: 0;
+	height: 100%;
+	width: 100%;
 }
 
 .main-content h1 {
 	margin-bottom: 4px;
 }
 
-.main-content p.subtext {
+.main-content .subtext {
 	margin-top: 0;
 	padding-bottom: 4px;
 	border-bottom: 2px solid gray;
