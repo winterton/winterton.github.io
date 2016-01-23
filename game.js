@@ -191,13 +191,13 @@ document.addEventListener("DOMContentLoaded", function(){
     startGame();
 });
 
-document.addEventListener('click', function(e){
-    var x = Math.floor(e.clientX / 20);
-    var y = Math.floor(e.clientY / 20);
+function handleClick(e) {
+    var x = Math.floor(e.pageX / 20);
+    var y = Math.floor(e.pageY / 20);
 
 
     var rand = getRandomIndex(0,4);
-    console.log(rand);
+
     switch (rand) {
         case 0:
             insertToad(x,y);
@@ -214,4 +214,9 @@ document.addEventListener('click', function(e){
     }
     drawGame();
 
-});
+}
+
+
+document.addEventListener('click', handleClick, true);
+
+document.addEventListener('touchend', handleClick, true);
