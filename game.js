@@ -1,5 +1,3 @@
-//TODO: Refactor this!!!
-
 function insertPoint(x, y) {
     if (map[y][x] === 0) {
         map[y][x] = 1;
@@ -157,7 +155,6 @@ function drawGame() {
     canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
 
-
     context.fillStyle = 'rgba(0,0,0,0)';
     context.fillRect(0,0,canvas.width, canvas.height);
 
@@ -169,7 +166,7 @@ function drawGame() {
         var xOffset = 0;
         for (var x = 0; x < map[y].length; ++x) {
             if (map[y][x] === 1) {
-                context.fillStyle = 'rgba(0,0,0,.5)';
+                context.fillStyle = 'rgba(0,0,0,.25)';
             } else {
                 context.fillStyle = 'rgba(0,0,0,0)';
             }
