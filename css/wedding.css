@@ -1,0 +1,33 @@
+
+.main {
+    color: slategrey;
+    padding: 10%;
+}
+
+.main .subtext {
+    text-align: center;
+}
+
+.gold {
+    color: goldenrod;
+}
+
+#welcome-header {
+    text-align: center;
+}
+
+.font-formal {
+    font-family: 'Petit Formal Script', cursive;
+}
+
+.font-lora {
+    font-family: 'Lora', serif;
+}
+
+.font-cinzel {
+    font-family: 'Cinzel', serif;
+}
+
+#map-frame {
+    text-align: center;
+}

@@ -10,7 +10,7 @@ body {
 	margin: 0;
 }
 
-html {
+html.global-bg {
 	background-color: #91a8d0;
 }
 
@@ -63,4 +63,8 @@ canvas {
 
 .main-content ul li a:hover {
 	color: lightgray;
+}
+
+.inline-block {
+	display: inline-block;
 }
