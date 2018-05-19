@@ -1,11 +1,17 @@
 <!DOCTYPE html>
+<meta charset="UTF-8"> 
 <html>
 	<head>
 		<title>Wedding of Chance Ackley &amp; Jacob Smith</title>
 		<link href='css/global-styles.css' rel='stylesheet' type='text/css'>
         <link href='css/wedding.css' rel='stylesheet' type='text/css'>
         <link href="https://fonts.googleapis.com/css?family=Cinzel|Lora|Petit+Formal+Script" rel="stylesheet"> 
+        <script
+			  src="https://code.jquery.com/jquery-3.3.1.min.js"
+			  integrity="sha256-FgpCb/KJQlLNfOu91ta32o/NMZxltwRo8QtmkMRdAu8="
+			  crossorigin="anonymous"></script>
         <script type='text/javascript' src='game.js'></script>
+        <script type='text/javascript' src='rsvp.js'></script>
 	</head>
 	<body>
 		<canvas id='canvas'></canvas>
@@ -81,12 +87,17 @@
                     <li><a href="https://secure.ffrf.org/np/clients/ffrf/donation.jsp?_ga=2.122189003.1319012.1526158356-432633820.1526158356">The Freedom From Religion Foundation</a></li>
                 </ul>
             </div>
-        <!--
             <div id="rsvp">
                 <h2>RSVP</h2>
-                <p>Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.</p>
+                <p>Feel free to RSVP by mail or by providing your response below:</p>
+                <form id="rsvpform">
+                    <input placeholder="First name?" type="text" name="firstname" required><br/>
+                    <input placeholder="Last name?" type="text" name="lastname" required><br/>
+                    <input placeholder="Number of guests?" type="number" name="guests" required><br/>
+                    <input placeholder="Anything else we should know?" type="text" name="notes" required><br/>
+                    <input type="submit" value="Submit">
+                </form>
             </div>
-        -->
             <div id="contact">                
                 <h2>Contact Us</h2>
                 <p>If you have any questions, feel free to contact us.</p>

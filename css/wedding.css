@@ -31,3 +31,27 @@
 #map-frame {
     text-align: center;
 }
+
+#rsvpform {
+    text-align: center;
+}
+
+#rsvpform input {
+    display: inline-block;
+    border: none;
+    border-bottom: 1px solid slategray;
+    width: 75%;
+    color: slategray;
+    margin-top: 10px;
+    font-size: 14pt;
+    font-family: 'Cinzel', serif;
+}
+
+#rsvpform input[type="submit"] {
+    background-color: slategray;
+    width: 50%;
+    border: 1px solid;
+    margin: 20px;
+    color: white;
+    cursor: pointer;
+}
