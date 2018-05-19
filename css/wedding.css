@@ -55,3 +55,7 @@
     color: white;
     cursor: pointer;
 }
+
+input.error {
+    background-color: darkred !important;
+}
