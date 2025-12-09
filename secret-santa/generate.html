@@ -12,6 +12,8 @@
       button { background: #0069d9; color: #fff; border: none; padding: 10px 16px; font-size: 15px; border-radius: 4px; cursor: pointer; }
       button:hover { background: #0056b3; }
       .error { color: #b00020; margin-top: 8px; }
+      .controls { display: flex; align-items: center; gap: 12px; margin-top: 10px; flex-wrap: wrap; }
+      .checkbox { display: inline-flex; align-items: center; gap: 6px; font-size: 14px; }
       table { width: 100%; border-collapse: collapse; margin-top: 20px; }
       th, td { padding: 10px; border-bottom: 1px solid #e3e3e7; text-align: left; font-size: 14px; }
       th { background: #f7f7fa; }
@@ -25,8 +27,12 @@
       <p>Enter one participant per line. Names will be shuffled securely, and each person gets their own reveal link.</p>
       <form id="generator-form">
         <textarea id="participants" placeholder="Alice&#10;Bob&#10;Charlie"></textarea>
-        <div style="margin-top: 10px;">
+        <div class="controls">
           <button type="submit">Generate Links</button>
+          <label class="checkbox">
+            <input type="checkbox" id="hide-receivers">
+            Hide receivers
+          </label>
           <span id="error" class="error"></span>
         </div>
       </form>
@@ -38,6 +44,7 @@
       (function () {
         const form = document.getElementById("generator-form");
         const textarea = document.getElementById("participants");
+        const hideReceiversInput = document.getElementById("hide-receivers");
         const errorEl = document.getElementById("error");
         const resultsEl = document.getElementById("results");
 
@@ -48,17 +55,18 @@
             .filter(Boolean);
         }
 
-        function renderResults(links) {
+        function renderResults(links, hideReceivers) {
           if (!Array.isArray(links) || !links.length) {
             resultsEl.innerHTML = "";
             return;
           }
 
           const rows = links.map(link => {
+            const receiverText = hideReceivers ? "Hidden" : link.receiver;
             return `
               <tr>
                 <td>${link.giver}</td>
-                <td>${link.receiver}</td>
+                <td>${receiverText}</td>
                 <td class="link-cell"><a href="${link.url}" target="_blank" rel="noopener noreferrer">${link.url}</a></td>
               </tr>
             `;
@@ -69,7 +77,7 @@
               <thead>
                 <tr>
                   <th>Participant</th>
-                  <th>Receives</th>
+                  <th>Receives${hideReceivers ? " (hidden)" : ""}</th>
                   <th>Reveal Link</th>
                 </tr>
               </thead>
@@ -91,7 +99,7 @@
 
           try {
             const links = window.SecretSanta.generateLinks(names);
-            renderResults(links);
+            renderResults(links, hideReceiversInput.checked);
           } catch (err) {
             console.error(err);
             errorEl.textContent = err.message || "Could not generate links.";
