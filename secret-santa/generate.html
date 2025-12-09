@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Secret Santa Link Generator</title>
+    <link href="style.css" rel="stylesheet" type="text/css">
+    <style>
+      body { font-family: Arial, sans-serif; background: #f4f4f6; color: #222; margin: 0; padding: 0; }
+      .container { max-width: 760px; margin: 40px auto; background: #fff; padding: 24px 28px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08); }
+      h1 { margin-top: 0; font-size: 24px; }
+      textarea { width: 100%; min-height: 160px; font-size: 14px; padding: 12px; box-sizing: border-box; }
+      button { background: #0069d9; color: #fff; border: none; padding: 10px 16px; font-size: 15px; border-radius: 4px; cursor: pointer; }
+      button:hover { background: #0056b3; }
+      .error { color: #b00020; margin-top: 8px; }
+      table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+      th, td { padding: 10px; border-bottom: 1px solid #e3e3e7; text-align: left; font-size: 14px; }
+      th { background: #f7f7fa; }
+      .link-cell a { word-break: break-all; color: #0069d9; }
+    </style>
+    <script type="text/javascript" src="generate.js"></script>
+  </head>
+  <body>
+    <div class="container">
+      <h1>Secret Santa Link Generator</h1>
+      <p>Enter one participant per line. Names will be shuffled securely, and each person gets their own reveal link.</p>
+      <form id="generator-form">
+        <textarea id="participants" placeholder="Alice&#10;Bob&#10;Charlie"></textarea>
+        <div style="margin-top: 10px;">
+          <button type="submit">Generate Links</button>
+          <span id="error" class="error"></span>
+        </div>
+      </form>
+
+      <div id="results"></div>
+    </div>
+
+    <script>
+      (function () {
+        const form = document.getElementById("generator-form");
+        const textarea = document.getElementById("participants");
+        const errorEl = document.getElementById("error");
+        const resultsEl = document.getElementById("results");
+
+        function parseNames(text) {
+          return text
+            .split(/\r?\n/)
+            .map(name => name.trim())
+            .filter(Boolean);
+        }
+
+        function renderResults(links) {
+          if (!Array.isArray(links) || !links.length) {
+            resultsEl.innerHTML = "";
+            return;
+          }
+
+          const rows = links.map(link => {
+            return `
+              <tr>
+                <td>${link.giver}</td>
+                <td>${link.receiver}</td>
+                <td class="link-cell"><a href="${link.url}" target="_blank" rel="noopener noreferrer">${link.url}</a></td>
+              </tr>
+            `;
+          }).join("");
+
+          resultsEl.innerHTML = `
+            <table>
+              <thead>
+                <tr>
+                  <th>Participant</th>
+                  <th>Receives</th>
+                  <th>Reveal Link</th>
+                </tr>
+              </thead>
+              <tbody>${rows}</tbody>
+            </table>
+          `;
+        }
+
+        form.addEventListener("submit", evt => {
+          evt.preventDefault();
+          errorEl.textContent = "";
+          resultsEl.innerHTML = "";
+
+          const names = parseNames(textarea.value);
+          if (names.length < 2) {
+            errorEl.textContent = "Please enter at least two participants.";
+            return;
+          }
+
+          try {
+            const links = window.SecretSanta.generateLinks(names);
+            renderResults(links);
+          } catch (err) {
+            console.error(err);
+            errorEl.textContent = err.message || "Could not generate links.";
+          }
+        });
+      })();
+    </script>
+  </body>
+</html>
