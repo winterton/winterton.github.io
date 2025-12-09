@@ -1,3 +1,6 @@
+@import url('https://fonts.googleapis.com/css2?family=Mountains+of+Christmas:wght@400;700&family=Poppins:wght@300;400;600&display=swap');
+
+
 html, body {
     height: 100%;
     margin: 0;
@@ -8,7 +11,7 @@ body {
     display: flex;
     align-items: center;
     justify-content: center;
-    font-family: Arial, Helvetica, sans-serif;
+    font-family: 'Poppins', sans-serif;
     color: #2F6D3A;
 }
 
@@ -21,4 +24,5 @@ body {
     color: #C84747;
     font-weight: 700;
     font-size: 48pt;
+    font-family: 'Mountains of Christmas', cursive;
 }
