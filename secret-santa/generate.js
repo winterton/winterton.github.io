@@ -75,7 +75,7 @@
       const encodedPayload = urlSafeBase64Encode(encoder.encode(JSON.stringify(payload)));
       const url = new URL("reveal.html", window.location.href);
       url.searchParams.set("data", encodedPayload);
-      url.searchParams.set("giver",payload.giver);
+      url.searchParams.set("giver", giver);
 
       return {
         giver,
