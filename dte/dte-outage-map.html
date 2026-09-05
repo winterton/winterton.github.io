@@ -190,6 +190,8 @@
     // ordering
     const order = jobs.slice();
     if(sim.priority === 'waves') order.sort((a,b) => (a._wave||7) - (b._wave||7) || (b.NUM_CUST||0)-(a.NUM_CUST||0));
+    else if(sim.priority === 'fifo') // upstream first; biggest-first for mainline tiers, then oldest-first for laterals and below (how service-center queues actually run)
+      order.sort((a,b) => (a._wave||7) - (b._wave||7) || ((a._wave||7) <= 3 ? (b.NUM_CUST||0)-(a.NUM_CUST||0) : (a.OFF_DTTM||Infinity)-(b.OFF_DTTM||Infinity)));
     else order.sort((a,b) => ((b.NUM_CUST||0)/b._workH) - ((a.NUM_CUST||0)/a._workH));
     // safety calls first regardless — small, and they're what crews actually get sent to first
     order.sort((a,b) => (a._wave===0?0:1) - (b._wave===0?0:1));
@@ -578,7 +580,7 @@
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 12px;font-size:13px;margin-bottom:10px">
           <label>Crews<br><input id="simCrews" type="number" min="100" max="10000" step="100" value="${sim.crews}" style="width:100%;font:inherit;padding:4px 6px;border:1px solid var(--line);border-radius:6px"></label>
           <label title="Share of the quoted headcount actually clearing outages at any moment. DTE's storm counts include tree crews, assessors, wire guards, and crews still en route.">Share clearing outages<br><input id="simEff" type="number" min="0.1" max="1" step="0.05" value="${sim.efficiency}" style="width:100%;font:inherit;padding:4px 6px;border:1px solid var(--line);border-radius:6px"></label>
-          <label style="grid-column:1/-1">Dispatch priority<br><select id="simPri" style="width:100%"><option value="waves" ${sim.priority==='waves'?'selected':''}>Upstream first, biggest jobs first within a tier</option><option value="cph" ${sim.priority==='cph'?'selected':''}>Most customers per crew-hour</option></select></label>
+          <label style="grid-column:1/-1">Dispatch priority<br><select id="simPri" style="width:100%"><option value="waves" ${sim.priority==='waves'?'selected':''}>Upstream first, biggest jobs first within a tier</option><option value="fifo" ${sim.priority==='fifo'?'selected':''}>Upstream first, then oldest outage first</option><option value="cph" ${sim.priority==='cph'?'selected':''}>Most customers per crew-hour</option></select></label>
         </div>
         ${sim.horizonH != null ? `<div class="sub" style="margin-bottom:4px">Model: all customers back in about <span>${sim.horizonH < 48 ? Math.round(sim.horizonH)+' hours' : (sim.horizonH/24).toFixed(1)+' days'}</span> · ${fmt(Math.round(sim.crews*sim.efficiency))} effective crews${sim.impliedCrews ? ` · <span title="Effective crews that would make this model land on DTE's latest estimate">DTE's estimates imply ~${fmt(sim.impliedCrews)}</span>` : ''} · half restored by <span>${(() => { const pts=outages.map(f=>f.properties).filter(p=>p._wave!==0&&p._simEtr).sort((a,b)=>a._simEtr-b._simEtr); const tot=pts.reduce((a,p)=>a+(p.NUM_CUST||0),0); let acc=0; for(const p of pts){ acc+=p.NUM_CUST||0; if(acc>=tot/2) return fmtTime(p._simEtr); } return '—'; })()}</span></div>${restoreCurve()}` : ''}
         <details style="font-size:12px;color:var(--muted);margin:6px 0 10px"><summary style="cursor:pointer">Assumed repair times</summary>
