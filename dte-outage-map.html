@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DTE storm outages</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  :root{
+    --bg:#f3f4f6; --rail:#ffffff; --ink:#1c2230; --muted:#6b7280; --line:#e3e6ea;
+    --heat1:#f6c453; --heat2:#f08a3c; --heat3:#e2552b; --heat4:#b31d1d; --heat5:#5c0a0a;
+    --storm:#b31d1d; --ok:#2f7d4a;
+    --font: -apple-system, "Segoe UI", "Helvetica Neue", Inter, Roboto, sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font-family:var(--font);font-size:14px;line-height:1.4;font-variant-numeric:tabular-nums}
+  #app{display:grid;grid-template-columns:340px 1fr;grid-template-rows:auto 1fr;height:100%}
+  header{grid-column:1/-1;display:flex;align-items:baseline;gap:18px;padding:12px 18px;border-bottom:1px solid var(--line);background:var(--rail)}
+  header h1{margin:0;font-size:17px;font-weight:600;letter-spacing:-.01em}
+  header .status{color:var(--muted);font-size:13px}
+  header .status b{color:var(--ink);font-weight:500}
+  header button{margin-left:auto;background:none;border:1px solid var(--line);border-radius:6px;padding:5px 10px;font:inherit;font-size:13px;color:var(--ink);cursor:pointer}
+  header button:hover{background:var(--bg)}
+  header button:focus-visible,tr:focus-visible,select:focus-visible{outline:2px solid #2563eb;outline-offset:2px}
+
+  aside{background:var(--rail);border-right:1px solid var(--line);overflow:auto;display:flex;flex-direction:column}
+  .hero{padding:18px 18px 14px;border-bottom:1px solid var(--line)}
+  .hero .big{font-size:44px;font-weight:600;letter-spacing:-.03em;line-height:1}
+  .hero .big small{font-size:14px;font-weight:400;color:var(--muted);letter-spacing:0;margin-left:6px}
+  .hero .sub{color:var(--muted);margin-top:6px}
+  .hero .sub span{color:var(--ink)}
+
+  section{padding:14px 18px;border-bottom:1px solid var(--line)}
+  section h2{margin:0 0 10px;font-size:13px;font-weight:600}
+  .centers{display:grid;gap:6px}
+  .center{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;font-size:13px}
+  .center .bar{grid-column:1/-1;height:4px;background:var(--line);border-radius:2px;overflow:hidden}
+  .center .bar i{display:block;height:100%;background:var(--heat3)}
+  .center .name{display:flex;align-items:center;gap:6px}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);flex:none}
+  .dot.storm{background:var(--storm)}
+  .center .n{color:var(--muted)}
+
+  .controls{display:flex;gap:8px;align-items:center;margin-bottom:10px}
+  select{font:inherit;font-size:13px;padding:4px 6px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--ink)}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:left;font-weight:500;color:var(--muted);padding:4px 0;border-bottom:1px solid var(--line);cursor:pointer;user-select:none}
+  th.num,td.num{text-align:right}
+  td{padding:6px 0;border-bottom:1px solid var(--line);vertical-align:top}
+  tr.row{cursor:pointer}
+  tr.row:hover td,tr.row.active td{background:#fff7ed}
+  td .meta{color:var(--muted);font-size:12px}
+  .swatch{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px;vertical-align:middle}
+
+  #map{height:100%;width:100%}
+  .legend{position:absolute;right:12px;bottom:12px;z-index:800;background:#fff;border:1px solid var(--line);border-radius:6px;padding:10px 12px;font-size:12px}
+  .legend div{display:flex;align-items:center;gap:8px;margin:3px 0}
+  .legend i{width:14px;height:10px;border-radius:2px;display:inline-block}
+  .leaflet-popup-content{font-family:var(--font);font-size:13px;margin:12px 14px}
+  .leaflet-popup-content b{font-weight:600}
+  .leaflet-popup-content .kv{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin-top:6px;color:var(--muted)}
+  .leaflet-popup-content .kv span:nth-child(even){color:var(--ink)}
+
+  .empty,.error{padding:18px;color:var(--muted)}
+  .error{color:#9a1c1c}
+  .loading{padding:18px;color:var(--muted)}
+  @media (max-width:800px){
+    #app{grid-template-columns:1fr;grid-template-rows:auto 45vh 1fr}
+    aside{border-right:0;border-top:1px solid var(--line);order:3}
+    #mapwrap{order:2}
+  }
+  @media (prefers-reduced-motion:no-preference){ .center .bar i{transition:width .4s ease} }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>DTE storm outages</h1>
+    <div class="status" id="status">Loading…</div>
+    <button id="locate" type="button" style="margin-left:auto">Center on me</button>
+    <button id="refresh" type="button" style="margin-left:0">Refresh now</button>
+  </header>
+
+  <aside id="rail">
+    <div class="loading">Querying DTE outage service…</div>
+  </aside>
+
+  <div id="mapwrap" style="position:relative">
+    <div id="map"></div>
+    <div class="legend" id="legend"></div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+(() => {
+  const BASE = 'https://outagemap.serv.dteenergy.com/arcgis/rest/services/OMP/OutageLocations/MapServer';
+  const REFRESH_MS = 15 * 60 * 1000;               // service updates every 15 min
+  const BREAKS = [                                  // customers out → color
+    [100,  getVar('--heat1'), '1 – 99'],
+    [500,  getVar('--heat2'), '100 – 499'],
+    [1500, getVar('--heat3'), '500 – 1,499'],
+    [2500, getVar('--heat4'), '1,500 – 2,499'],
+    [Infinity, getVar('--heat5'), '2,500+'],
+  ];
+  function getVar(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+  const color = n => n == null ? '#8a94a3' : BREAKS.find(b => n < b[0])[1];
+  const fmt = n => (n ?? 0).toLocaleString('en-US');
+  const fmtTime = ms => ms ? new Date(ms).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : '—';
+  const ago = ms => { if(!ms) return '—'; const m=Math.round((Date.now()-ms)/60000); return m<60? m+'m' : Math.floor(m/60)+'h '+(m%60)+'m'; };
+  // EVENT_STATUS is truncated to 10 chars by the service; CREW_STATUS is never populated.
+  const STATUS_LABEL = {'In Progres':'In progress','PC3 Verifi':'Verifying restoration'};
+  const statusName = s => s ? (STATUS_LABEL[s] || s) : 'Unassessed';
+  // Job-level ETR when set, otherwise the circuit-level estimate (often published first)
+  const etr = p => p.EST_REP_DTTM || p.CIRCUIT_EST_DTTM || null;
+  const etrLabel = p => p.EST_REP_DTTM ? fmtTime(p.EST_REP_DTTM) : p.CIRCUIT_EST_DTTM ? fmtTime(p.CIRCUIT_EST_DTTM)+' (circuit)' : '—';
+
+  // ---- ArcGIS query: try fetch, fall back to JSONP if CORS blocks it ----
+  let jsonpN = 0;
+  function jsonp(url){
+    return new Promise((res, rej) => {
+      const cb = '__dte_cb' + (jsonpN++);
+      const s = document.createElement('script');
+      window[cb] = data => { delete window[cb]; s.remove(); res(data); };
+      s.onerror = () => { delete window[cb]; s.remove(); rej(new Error('JSONP failed')); };
+      s.src = url + '&callback=' + cb;
+      document.head.appendChild(s);
+    });
+  }
+  // DTE's server only allows CORS from its own origins, so go straight to JSONP
+  // (a plain script load sends no Origin header and needs no CORS approval).
+  async function query(layer, params){
+    const url = `${BASE}/${layer}/query?` + new URLSearchParams({ f:'json', ...params });
+    return jsonp(url);
+  }
+  async function queryAll(layer, params){
+    const out = []; let offset = 0;
+    for(;;){
+      const page = await query(layer, { ...params, resultOffset: offset, resultRecordCount: 1000 });
+      if(page.error) throw new Error(page.error.message || 'Service error');
+      out.push(...(page.features || []));
+      if(!page.exceededTransferLimit || !page.features?.length) break;
+      offset += page.features.length;
+    }
+    return out;
+  }
+  // Esri polygon rings → GeoJSON
+  const toGeo = f => ({ type:'Feature', properties:f.attributes,
+    geometry: f.geometry?.rings ? { type:'Polygon', coordinates:f.geometry.rings } : null });
+
+  // ---- Map ----
+  const map = L.map('map', { zoomControl:true }).setView([42.45, -83.2], 9);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+    attribution:'&copy; OpenStreetMap &copy; CARTO', maxZoom:18 }).addTo(map);
+  let outageLayer = null;
+  const layersById = new Map();
+
+  document.getElementById('legend').innerHTML =
+    '<div style="font-weight:600;margin-bottom:4px">Customers out</div>' +
+    BREAKS.map(b => `<div><i style="background:${b[1]}"></i>${b[2]}</div>`).join('');
+
+  // ---- State ----
+  let outages = [], stormModes = [], lastLoad = 0, timer = null, countdown = null;
+  let sortKey = 'NUM_CUST', sortDir = -1, centerFilter = 'all', activeId = null;
+  let userPos = null, userMarker = null;
+  const NEAR_MILES = 10;
+
+  function milesBetween(a, b){ // haversine, [lat,lng]
+    const R=3958.8, toR=d=>d*Math.PI/180;
+    const dLat=toR(b[0]-a[0]), dLng=toR(b[1]-a[1]);
+    const h=Math.sin(dLat/2)**2+Math.cos(toR(a[0]))*Math.cos(toR(b[0]))*Math.sin(dLng/2)**2;
+    return 2*R*Math.asin(Math.sqrt(h));
+  }
+  function polyCenter(f){ // rough centroid of the outer ring, returns [lat,lng]
+    const ring=f.geometry?.coordinates?.[0]; if(!ring?.length) return null;
+    let x=0,y=0; for(const [lng,lat] of ring){x+=lng;y+=lat;}
+    return [y/ring.length, x/ring.length];
+  }
+  function locate(pan=true){
+    if(!navigator.geolocation){ setStatus('Location not available in this browser'); return; }
+    navigator.geolocation.getCurrentPosition(pos => {
+      userPos=[pos.coords.latitude, pos.coords.longitude];
+      if(userMarker) userMarker.remove();
+      userMarker=L.circleMarker(userPos,{radius:7,color:'#fff',weight:2,fillColor:'#2563eb',fillOpacity:1}).addTo(map).bindTooltip('You');
+      if(pan) map.setView(userPos, 12);
+      if(outages.length) render();
+    }, err => setStatus(`Location unavailable: ${err.message}`), {enableHighAccuracy:false, timeout:8000, maximumAge:300000});
+  }
+
+  let zips = null, zipLayer = null, attrsMissing = false;
+  function pointInRing(pt, ring){ // ray cast, pt=[lat,lng], ring=[[lng,lat],...]
+    let inside=false; const [y,x]=pt;
+    for(let i=0,j=ring.length-1;i<ring.length;j=i++){
+      const [xi,yi]=ring[i],[xj,yj]=ring[j];
+      if((yi>y)!==(yj>y) && x < (xj-xi)*(y-yi)/(yj-yi)+xi) inside=!inside;
+    }
+    return inside;
+  }
+  const inPoly = (pt, f) => (f.geometry?.coordinates||[]).some(r => pointInRing(pt, r));
+  const zipCode = f => { const p=f.properties||{}; const k=Object.keys(p).find(k=>/zip/i.test(k)); return k ? String(p[k]) : null; };
+
+  async function loadZips(){
+    if(zips) return;
+    try {
+      const feat = await queryAll(1, { geometry:'-9391354,5134197,-9174147,5476370', geometryType:'esriGeometryEnvelope', inSR:102100,
+                      spatialRel:'esriSpatialRelIntersects', outFields:'*', outSR:4326, returnGeometry:true, geometryPrecision:4 });
+      zips = feat.map(toGeo).filter(f => f.geometry);
+      zipLayer = L.geoJSON({type:'FeatureCollection', features:zips}, {
+        style:{ color:'#9aa3ad', weight:.7, fill:false, dashArray:'3 3' }, interactive:false }).addTo(map);
+      zipLayer.bringToBack();
+    } catch(e){ zips = []; }
+  }
+
+  async function load(){
+    setStatus('Loading…');
+    try {
+      const [feat, modes] = await Promise.all([
+        // DTE's WAF 403s any `where` clause, so filter spatially (full service extent) instead,
+        // and pull the small storm-mode table by object id.
+        queryAll(2, { geometry:'-9391354,5134197,-9174147,5476370', geometryType:'esriGeometryEnvelope', inSR:102100,
+                      spatialRel:'esriSpatialRelIntersects', outFields:'*', outSR:4326, returnGeometry:true, geometryPrecision:5 }),
+        query(3, { objectIds: Array.from({length:60},(_,i)=>i+1).join(','), outFields:'*', returnGeometry:false }).catch(() => ({features:[]})),
+        loadZips(),
+      ]);
+      const all = feat.map(toGeo);
+      // DTE has intermittently served geometry with no attributes; keep the shapes and say so.
+      attrsMissing = all.length > 0 && all.every(f => f.properties.NUM_CUST == null);
+      outages = attrsMissing ? all : all.filter(f => f.properties.NUM_CUST > 0);
+      stormModes = (modes.features || []).map(f => f.attributes);
+      lastLoad = Date.now();
+      render();
+    } catch(e){
+      document.getElementById('rail').innerHTML =
+        `<div class="error">Couldn't reach the DTE outage service.<br><span style="color:var(--muted)">${e.message}</span><br><br>Check the service in a new tab: <a href="${BASE}" target="_blank" rel="noopener">outagemap.serv.dteenergy.com</a></div>`;
+      setStatus('Load failed');
+    }
+    clearTimeout(timer); timer = setTimeout(load, REFRESH_MS);
+  }
+
+  function setStatus(t){ document.getElementById('status').innerHTML = t; }
+  function tick(){
+    if(!lastLoad) return;
+    const left = Math.max(0, REFRESH_MS - (Date.now()-lastLoad));
+    const m = Math.floor(left/60000), s = Math.floor(left%60000/1000);
+    setStatus(`Updated <b>${new Date(lastLoad).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'})}</b> · next refresh in ${m}:${String(s).padStart(2,'0')}`);
+  }
+  clearInterval(countdown); countdown = setInterval(tick, 1000);
+
+  function render(){
+    // headline numbers
+    const custOut = outages.reduce((a,f)=>a+(f.properties.NUM_CUST||0),0);
+    const custRestored = outages.reduce((a,f)=>a+(f.properties.NUM_CUST_RESTORED||0),0);
+    const dispatched = outages.filter(f => f.properties.DISPATCH_DTTM).length;
+    const byStatus = {};
+    for(const f of outages){ const s=statusName(f.properties.EVENT_STATUS); byStatus[s]=(byStatus[s]||0)+1; }
+    const statusLine = Object.entries(byStatus).sort((a,b)=>b[1]-a[1]).map(([s,n])=>`<span>${n}</span> ${s.toLowerCase()}`).join(' · ');
+
+    // by service center (with restoration progress)
+    const byCenter = {};
+    for(const f of outages){
+      const p=f.properties, c = p.SERVICE_CENTER || 'Unknown';
+      (byCenter[c] ||= {cust:0, n:0, storm:false, affected:0, restored:0});
+      byCenter[c].cust += p.NUM_CUST||0; byCenter[c].n++;
+      byCenter[c].affected += p.TOAL_CUST_AFFECTED||p.NUM_CUST||0; byCenter[c].restored += p.NUM_CUST_RESTORED||0;
+      if(/y|on|true|1/i.test(String(p.STORM_MODE||''))) byCenter[c].storm = true;
+    }
+    // what broke
+    const byDev = {};
+    for(const f of outages){ const d=f.properties.DEV_TYPE_NAME||'Not yet identified'; (byDev[d] ||= {n:0,cust:0}); byDev[d].n++; byDev[d].cust += f.properties.NUM_CUST||0; }
+    const devs = Object.entries(byDev).sort((a,b)=>b[1].cust-a[1].cust);
+    // ZIP rollup: assign each outage to the ZIP containing its centroid
+    const byZip = {};
+    if(zips?.length){
+      for(const f of outages){
+        const c = polyCenter(f); if(!c) continue;
+        const z = zips.find(zf => inPoly(c, zf)); const code = z ? zipCode(z) : null; if(!code) continue;
+        f.properties._zip = code;
+        (byZip[code] ||= {cust:0,n:0}); byZip[code].cust += f.properties.NUM_CUST||0; byZip[code].n++;
+      }
+    }
+    const zipRows = Object.entries(byZip).sort((a,b)=>b[1].cust-a[1].cust).slice(0,10);
+    const maxZip = Math.max(1, ...zipRows.map(z=>z[1].cust));
+    // storm-mode table (field names unknown ahead of time; match loosely)
+    for(const row of stormModes){
+      const nameKey = Object.keys(row).find(k => /center|name/i.test(k));
+      const modeKey = Object.keys(row).find(k => /mode|storm/i.test(k) && k !== nameKey);
+      if(!nameKey || !modeKey) continue;
+      const name = row[nameKey]; const v = String(row[modeKey] ?? '');
+      (byCenter[name] ||= {cust:0,n:0,storm:false,affected:0,restored:0});
+      if(/y|on|true|1|storm/i.test(v) && !/normal|off|n$/i.test(v)) byCenter[name].storm = true;
+    }
+    const centers = Object.entries(byCenter).sort((a,b)=>b[1].cust-a[1].cust);
+    const maxCust = Math.max(1, ...centers.map(c=>c[1].cust));
+    const stormCount = centers.filter(c=>c[1].storm).length;
+
+    const near = userPos ? outages.map(f => ({f, d: polyCenter(f) ? milesBetween(userPos, polyCenter(f)) : Infinity}))
+      .filter(x => x.d <= NEAR_MILES).sort((a,b)=>a.d-b.d) : null;
+
+    const rail = document.getElementById('rail');
+    rail.innerHTML = `
+      <div class="hero">
+        <div class="big">${attrsMissing ? '—' : fmt(custOut)}<small>customers out</small></div>
+        ${attrsMissing ? `<div class="sub" style="color:#9a1c1c">DTE is currently serving outage shapes without details. Showing locations only.</div>` : `
+        <div class="sub"><span>${fmt(outages.length)}</span> active outages · <span>${fmt(custRestored)}</span> restored on open jobs · <span>${dispatched}</span> with crews dispatched</div>
+        <div class="sub">${statusLine}</div>`}
+      </div>
+      <section>
+        <h2>Within ${NEAR_MILES} miles of you${near ? ` · ${near.length} outage${near.length===1?'':'s'}` : ''}</h2>
+        ${!near ? `<div style="color:var(--muted)">Allow location access, or use "Center on me" above.</div>`
+          : near.length===0 ? `<div style="color:var(--muted)">No outages reported near you.</div>`
+          : `<table><tbody>${near.slice(0,8).map(({f,d}) => { const p=f.properties; return `
+            <tr class="row" tabindex="0" data-id="${p.OBJECTID}">
+              <td><span class="swatch" style="background:${color(p.NUM_CUST)}"></span>${p.JOB_ID||'—'}<div class="meta">${p.CAUSE||'Cause pending'} · est. ${fmtTime(etr(p))}</div></td>
+              <td class="num">${fmt(p.NUM_CUST)}<div class="meta">${d.toFixed(1)} mi</div></td>
+            </tr>`; }).join('')}</tbody></table>`}
+      </section>
+      <section>
+        <h2>Service centers ${stormCount ? `· <span style="color:var(--storm)">${stormCount} in storm mode</span>` : '· none in storm mode'}</h2>
+        <div class="centers">
+          ${centers.map(([name,c]) => { const pct = c.affected ? c.restored/c.affected*100 : 0; return `
+            <div class="center">
+              <div class="name"><span class="dot ${c.storm?'storm':''}" title="${c.storm?'Storm mode':'Normal'}"></span>${name}</div>
+              <div class="n">${fmt(c.cust)} out · ${c.n} jobs${c.restored ? ` · ${pct.toFixed(0)}% restored` : ''}</div>
+              <div class="bar" title="${fmt(c.restored)} of ${fmt(c.affected)} affected customers restored on open jobs"><i style="width:${(c.cust/maxCust*100).toFixed(1)}%"></i></div>
+            </div>`; }).join('')}
+        </div>
+      </section>
+      <section>
+        <h2>What failed</h2>
+        <div class="centers">
+          ${devs.slice(0,8).map(([name,d]) => `
+            <div class="center" style="grid-template-columns:1fr auto">
+              <div class="name">${name}</div>
+              <div class="n">${fmt(d.cust)} · ${d.n} jobs</div>
+            </div>`).join('')}
+        </div>
+      </section>
+      <section>
+        <h2>By ZIP code${zips === null ? '' : zips.length === 0 ? ' · boundaries unavailable' : ''}</h2>
+        ${zipRows.length === 0 ? `<div style="color:var(--muted)">${zips?.length ? 'No outages mapped to a ZIP.' : 'ZIP boundaries didn\'t load.'}</div>` : `
+        <div class="centers">
+          ${zipRows.map(([z,c]) => `
+            <div class="center zip" tabindex="0" data-zip="${z}" style="cursor:pointer">
+              <div class="name">${z}</div>
+              <div class="n">${fmt(c.cust)} out · ${c.n} jobs</div>
+              <div class="bar"><i style="width:${(c.cust/maxZip*100).toFixed(1)}%"></i></div>
+            </div>`).join('')}
+        </div>`}
+      </section>
+      <section>
+        <div class="controls">
+          <h2 style="margin:0">Outages</h2>
+          <select id="centerSel" aria-label="Filter by service center" style="margin-left:auto">
+            <option value="all">All centers</option>
+            ${centers.map(([n]) => `<option value="${n}" ${n===centerFilter?'selected':''}>${n}</option>`).join('')}
+          </select>
+        </div>
+        <table>
+          <thead><tr>
+            <th data-k="JOB_ID">Job</th>
+            <th data-k="NUM_CUST" class="num">Out</th>
+            <th data-k="OFF_DTTM" class="num">Since</th>
+            <th data-k="EST_REP_DTTM" class="num">Est. restore</th>
+          </tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </section>`;
+    rail.querySelector('#centerSel').onchange = e => { centerFilter = e.target.value; renderRows(); drawMap(); };
+    rail.querySelectorAll('th').forEach(th => th.onclick = () => {
+      const k = th.dataset.k; if(sortKey===k) sortDir*=-1; else { sortKey=k; sortDir = k==='JOB_ID'?1:-1; }
+      renderRows();
+    });
+    rail.querySelectorAll('.zip').forEach(el => {
+      const go = () => { const z = zips.find(f => zipCode(f)===el.dataset.zip); if(z){ map.fitBounds(L.geoJSON(z).getBounds()); } };
+      el.onclick = go; el.onkeydown = e => { if(e.key==='Enter'||e.key===' ') { e.preventDefault(); go(); } };
+    });
+    renderRows(); drawMap();
+    if(outages.length===0) rail.querySelector('#rows').innerHTML = `<tr><td colspan="4" class="empty">No active outages reported.</td></tr>`;
+  }
+
+  const visible = () => outages.filter(f => centerFilter==='all' || (f.properties.SERVICE_CENTER||'Unknown')===centerFilter);
+
+  function renderRows(){
+    const rows = visible().sort((a,b) => {
+      const x=sortKey==='EST_REP_DTTM'?etr(a.properties):a.properties[sortKey], y=sortKey==='EST_REP_DTTM'?etr(b.properties):b.properties[sortKey];
+      return (x==null)-(y==null) || (x>y?1:x<y?-1:0)*sortDir;
+    });
+    document.getElementById('rows').innerHTML = rows.slice(0,300).map(f => { const p=f.properties; return `
+      <tr class="row ${p.OBJECTID===activeId?'active':''}" tabindex="0" data-id="${p.OBJECTID}">
+        <td><span class="swatch" style="background:${color(p.NUM_CUST)}"></span>${p.JOB_ID||'—'}<div class="meta">${p.CAUSE||'Cause pending'} · ${statusName(p.EVENT_STATUS)}${p.DISPATCH_DTTM?' · crew dispatched':''}${p._zip?' · '+p._zip:''}</div></td>
+        <td class="num">${fmt(p.NUM_CUST)}</td>
+        <td class="num" title="${fmtTime(p.OFF_DTTM)}">${ago(p.OFF_DTTM)}</td>
+        <td class="num">${etrLabel(p)}</td>
+      </tr>`; }).join('') + (rows.length>300 ? `<tr><td colspan="4" class="empty">Showing 300 of ${rows.length}. Filter by service center to see the rest.</td></tr>` : '');
+    document.querySelectorAll('tr.row').forEach(tr => {
+      const go = () => focusOutage(+tr.dataset.id);
+      tr.onclick = go; tr.onkeydown = e => { if(e.key==='Enter'||e.key===' ') { e.preventDefault(); go(); } };
+    });
+  }
+
+  function popup(p){
+    return `<b>${p.JOB_ID||'Outage'}</b> · ${fmt(p.NUM_CUST)} customers out
+      <div class="kv">
+        <span>Cause</span><span>${p.CAUSE||'Pending'}</span>
+        <span>Status</span><span>${statusName(p.EVENT_STATUS)}</span>
+        <span>Crew dispatched</span><span>${p.DISPATCH_DTTM ? fmtTime(p.DISPATCH_DTTM) : 'Not yet'}</span>
+        <span>Off since</span><span>${fmtTime(p.OFF_DTTM)}</span>
+        <span>Est. restore</span><span>${fmtTime(p.EST_REP_DTTM)}${p.EST_REP_ENDDTTM?' – '+fmtTime(p.EST_REP_ENDDTTM):''}</span>
+        <span>Circuit est.</span><span>${fmtTime(p.CIRCUIT_EST_DTTM)}${p.CIRCUIT_EST_ENDDTTM?' – '+fmtTime(p.CIRCUIT_EST_ENDDTTM):''}</span>
+        <span>Device</span><span>${p.DEV_TYPE_NAME||'—'} ${p.DEV_NAME||''}</span>
+        <span>Service center</span><span>${p.SERVICE_CENTER||'—'}${p.STORM_MODE?' · storm mode '+p.STORM_MODE:''}</span>
+        <span>Progress</span><span>${p.TOAL_CUST_AFFECTED ? Math.round((p.NUM_CUST_RESTORED||0)/p.TOAL_CUST_AFFECTED*100)+'% restored of '+fmt(p.TOAL_CUST_AFFECTED) : '—'}</span>
+        ${p._zip ? `<span>ZIP</span><span>${p._zip}</span>` : ''}
+      </div>`;
+  }
+
+  function drawMap(){
+    if(outageLayer) outageLayer.remove();
+    layersById.clear();
+    const feats = visible().filter(f => f.geometry);
+    outageLayer = L.geoJSON({type:'FeatureCollection', features:feats}, {
+      style: f => ({ color: color(f.properties.NUM_CUST), weight:1.5, fillColor: color(f.properties.NUM_CUST), fillOpacity:.55 }),
+      onEachFeature: (f, l) => { l.bindPopup(popup(f.properties), {maxWidth:320}); layersById.set(f.properties.OBJECTID, l);
+        l.on('click', () => { activeId = f.properties.OBJECTID; renderRows(); }); }
+    }).addTo(map);
+    if(feats.length && centerFilter!=='all') map.fitBounds(outageLayer.getBounds().pad(.1));
+  }
+
+  function focusOutage(id){
+    activeId = id; renderRows();
+    const l = layersById.get(id); if(!l) return;
+    map.fitBounds(l.getBounds().pad(.5), {maxZoom:14}); l.openPopup();
+  }
+
+  document.getElementById('refresh').onclick = load;
+  document.getElementById('locate').onclick = () => locate(true);
+  load();
+  locate(true);
+})();
+</script>
+</body>
+</html>
