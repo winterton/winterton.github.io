@@ -113,6 +113,128 @@
   const statusName = s => s ? (STATUS_LABEL[s] || s) : 'Unassessed';
   // Job-level ETR when set, otherwise the circuit-level estimate (often published first)
   const etr = p => p.EST_REP_DTTM || p.CIRCUIT_EST_DTTM || null;
+  // DTE's OMS tiers, ordered by how much of the network sits downstream of the failed component.
+  // Device (I)/(II) are undocumented; the descriptions below are inferred from job sizes and how DTE feeders are built.
+  const DEV_DESC = {
+    'Subtransmission': 'High-voltage line feeding substations. Hundreds to thousands of customers, whole neighborhoods.',
+    'Substation': 'Substation equipment. Everything fed from it is out.',
+    'Circuit Level': 'The breaker at the substation for one feeder circuit. Every customer on the circuit is out.',
+    'Device (II)': 'A mainline protective device on the feeder trunk (recloser or sectionalizer). Takes out everything downstream on that section, typically 100–3,000 customers.',
+    'Device (I)': 'A lateral fuse on a tap off the trunk, serving one street or subdivision. Typically a few dozen customers.',
+    'Service Transformer': 'The pole or pad transformer serving a handful of homes.',
+    'Service Secondary': 'Low-voltage wiring between the transformer and homes.',
+    'Single Customer': 'One service drop or meter.',
+    'Not yet identified': 'Reported but the failed component hasn\'t been determined. Wire-down and priority calls usually sit here.',
+  };
+  const TYCOD_LABEL = { 'OUTAGE':'Outage', 'SERVICE DOWN NO':'Wire down, no outage', 'PRIORITY':'Priority call' };
+  const tycod = p => TYCOD_LABEL[(p.TYCOD||'').trim()] || (p.TYCOD||'').trim() || null;
+  // Restoration waves: standard utility order, top-down. A job can't be restored before the jobs upstream of it.
+  const WAVES = [
+    { n:1, name:'Transmission & substations', tiers:['Subtransmission','Substation'] },
+    { n:2, name:'Feeder circuits',            tiers:['Circuit Level'] },
+    { n:3, name:'Mainline devices',           tiers:['Device (II)'] },
+    { n:4, name:'Lateral fuses',              tiers:['Device (I)'] },
+    { n:5, name:'Transformers & secondaries', tiers:['Service Transformer','Service Secondary'] },
+    { n:6, name:'Individual services',        tiers:['Single Customer', null] },
+  ];
+  const waveOf = p => { const t = tycod(p); if(t && t!=='Outage') return 0; const w = WAVES.find(w => w.tiers.includes(p.DEV_TYPE_NAME ?? null)); return w ? w.n : 6; };
+  const waveName = n => n===0 ? 'Safety call (wire down / priority)' : (WAVES.find(w=>w.n===n)?.name || '');
+  // For each job, find upstream jobs (lower wave number) whose polygon contains this job's centroid.
+  function deriveHierarchy(){
+    const byWave = {}; for(const f of outages){ f.properties._wave = waveOf(f.properties); (byWave[f.properties._wave] ||= []).push(f); }
+    const upstreamPool = outages.filter(f => f.properties._wave >= 1 && f.properties._wave <= 4 && f.geometry);
+    for(const u of upstreamPool){ // bbox prefilter, [minLat,minLng,maxLat,maxLng]
+      let b=[90,180,-90,-180]; for(const r of u.geometry.coordinates) for(const [lng,lat] of r){ if(lat<b[0])b[0]=lat; if(lng<b[1])b[1]=lng; if(lat>b[2])b[2]=lat; if(lng>b[3])b[3]=lng; } u.properties._bbox=b; }
+    const idx = new Map(outages.map(f => [f.properties.OBJECTID, f]));
+    for(const f of outages){
+      const p=f.properties, c=polyCenter(f); p._up=[]; p._effEtr = etr(p); p._blocked=false;
+      if(!c) continue;
+      for(const u of upstreamPool){
+        if(u===f || u.properties._wave >= p._wave) continue;
+        const b=u.properties._bbox; if(c[0]<b[0]||c[0]>b[2]||c[1]<b[1]||c[1]>b[3]) continue;
+        if(inPoly(c, u)) p._up.push(u.properties.OBJECTID);
+      }
+      // effective ETR = latest of own and all upstream ETRs
+      for(const id of p._up){ const u = idx.get(id); const ue = etr(u.properties); if(ue && (!p._effEtr || ue > p._effEtr)){ p._effEtr = ue; p._blocked = true; } }
+      p._up.sort((a,b)=> idx.get(a).properties._wave - idx.get(b).properties._wave);
+    }
+  }
+  // ---- Crew-capacity model ----
+  // Median crew-hours to clear a job at each tier, plus crews needed at once. Rough storm-restoration figures, not DTE data.
+  const REPAIR = {
+    'Subtransmission':      { hours:8,   crews:3, why:'Structure/conductor repair on a high-voltage line' },
+    'Substation':           { hours:6,   crews:2, why:'Substation equipment swap or switching' },
+    'Circuit Level':        { hours:4,   crews:2, why:'Trunk damage near the breaker; patrol whole feeder before closing' },
+    'Device (II)':          { hours:3,   crews:2, why:'Tree on three-phase mainline; clear, re-string, reclose' },
+    'Device (I)':           { hours:1.5, crews:1, why:'Lateral: clear limb, replace fuse or span' },
+    'Service Transformer':  { hours:2.5, crews:1, why:'Replace transformer or repair riser' },
+    'Service Secondary':    { hours:1.5, crews:1, why:'Secondary span repair' },
+    'Single Customer':      { hours:1,   crews:1, why:'Service drop / weatherhead' },
+    'Not yet identified':   { hours:1,   crews:1, why:'Assess and make safe' },
+  };
+  const TRAVEL_H = 0.5;                      // drive + assess per job
+  const sim = { crews:2500, efficiency:0.15, priority:'waves', horizonH:null, impliedCrews:null };
+  // efficiency: share of the quoted headcount actually clearing outages at any moment. DTE's storm 'crew' counts include tree crews,
+  // damage assessors, wire guards, and mutual-aid crews not yet on site, and storm work runs far slower than bench repair time.
+  const repairFor = p => REPAIR[p.DEV_TYPE_NAME || 'Not yet identified'] || REPAIR['Not yet identified'];
+  function runSim(){
+    const now = Date.now();
+    const jobs = outages.filter(f => f.geometry || true).map(f => f.properties);
+    const idx = new Map(outages.map(f => [f.properties.OBJECTID, f.properties]));
+    for(const p of jobs){
+      const r = repairFor(p); let h = r.hours + TRAVEL_H;
+      if(/In Progres/.test(p.EVENT_STATUS||'')) h *= 0.5;          // already being worked, assume half done
+      if(/PC3/.test(p.EVENT_STATUS||'')) h = 0.25;                  // verification only
+      p._workH = h; p._crewsNeeded = r.crews;
+    }
+    // ordering
+    const order = jobs.slice();
+    if(sim.priority === 'waves') order.sort((a,b) => (a._wave||7) - (b._wave||7) || (b.NUM_CUST||0)-(a.NUM_CUST||0));
+    else order.sort((a,b) => ((b.NUM_CUST||0)/b._workH) - ((a.NUM_CUST||0)/a._workH));
+    // safety calls first regardless — small, and they're what crews actually get sent to first
+    order.sort((a,b) => (a._wave===0?0:1) - (b._wave===0?0:1));
+    const nCrews = Math.max(1, Math.round(sim.crews * sim.efficiency));
+    const free = new Float64Array(nCrews).fill(now);      // ms when each crew is free
+    for(const p of order){
+      const k = Math.min(p._crewsNeeded, nCrews);
+      // pick k earliest-free crews
+      let picks = [];
+      for(let i=0;i<nCrews;i++){ if(picks.length<k){ picks.push(i); picks.sort((x,y)=>free[x]-free[y]); } else if(free[i] < free[picks[k-1]]){ picks[k-1]=i; picks.sort((x,y)=>free[x]-free[y]); } }
+      const start = Math.max(now, free[picks[k-1]]);
+      const end = start + p._workH*3600e3;
+      for(const i of picks) free[i] = end;
+      p._simDone = end;
+    }
+    // customers only come back when upstream is done too (process by wave so parents are final first)
+    for(const p of jobs.slice().sort((a,b)=>(a._wave||7)-(b._wave||7))){
+      let t = p._simDone;
+      for(const id of (p._up||[])){ const u = idx.get(id); if(u?._simEtr > t) t = u._simEtr; }
+      p._simEtr = t;
+    }
+    sim.horizonH = (Math.max(...jobs.filter(p=>p._wave!==0).map(p=>p._simEtr)) - now)/3600e3;
+  }
+  // What effective crew count would reproduce DTE's own latest estimate? Binary search on the same model.
+  function impliedCrews(){
+    const now = Date.now(), dteLast = Math.max(0, ...outages.map(f=>f.properties._effEtr||0));
+    if(!dteLast || dteLast <= now) return null;
+    const targetH = (dteLast - now)/3600e3, save = {c:sim.crews, e:sim.efficiency};
+    let lo=20, hi=20000;
+    for(let i=0;i<14;i++){ const mid=(lo+hi)/2; sim.crews=mid; sim.efficiency=1; runSim(); if(sim.horizonH > targetH) lo=mid; else hi=mid; }
+    sim.crews=save.c; sim.efficiency=save.e; runSim();
+    return Math.round((lo+hi)/2);
+  }
+  // customers-restored-over-time curve as a small SVG
+  function restoreCurve(){
+    const now=Date.now(), pts = outages.map(f=>f.properties).filter(p=>p._wave!==0 && p._simEtr).map(p=>[p._simEtr, p.NUM_CUST||0]).sort((a,b)=>a[0]-b[0]);
+    if(!pts.length) return '';
+    const total = pts.reduce((a,x)=>a+x[1],0), endT = pts[pts.length-1][0], W=300, H=60;
+    let acc=0, d=`M0,${H}`; for(const [t,c] of pts){ acc+=c; d += ` L${((t-now)/(endT-now)*W).toFixed(1)},${(H - acc/total*H).toFixed(1)}`; }
+    const ticks=[]; const hrs=(endT-now)/3600e3; const step = hrs>72?24:hrs>24?12:6;
+    for(let h=step; h<hrs; h+=step) ticks.push(`<line x1="${(h/hrs*W).toFixed(1)}" y1="0" x2="${(h/hrs*W).toFixed(1)}" y2="${H}" stroke="var(--line)"/><text x="${(h/hrs*W+2).toFixed(1)}" y="${H-3}" font-size="9" fill="var(--muted)">${h}h</text>`);
+    return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" style="display:block;margin:6px 0 2px" aria-label="Modelled customers restored over time">${ticks.join('')}<path d="${d}" fill="none" stroke="var(--heat3)" stroke-width="1.5"/></svg>`;
+  }
+  const CENTER_NAMES = { RFD:'Redford', PON:'Pontiac', HWL:'Howell', ANN:'Ann Arbor', CAN:'Caniff (Detroit)', MAR:'Marysville', NPT:'Newport', SBY:'Shelby', LAP:'Lapeer', WWS:'Western Wayne', MTC:'Mt. Clemens', NAE:'Northeast (Detroit)' };
+  const centerName = c => CENTER_NAMES[c] ? `${CENTER_NAMES[c]} <span style="color:var(--muted)">${c}</span>` : c;
   const etrLabel = p => p.EST_REP_DTTM ? fmtTime(p.EST_REP_DTTM) : p.CIRCUIT_EST_DTTM ? fmtTime(p.CIRCUIT_EST_DTTM)+' (circuit)' : '—';
 
   // ---- ArcGIS query: try fetch, fall back to JSONP if CORS blocks it ----
@@ -159,6 +281,102 @@
     '<div style="font-weight:600;margin-bottom:4px">Customers out</div>' +
     BREAKS.map(b => `<div><i style="background:${b[1]}"></i>${b[2]}</div>`).join('');
 
+
+  // ---- Kubra (DTE's customer-facing map backend) ----
+  // Two cheap calls give official totals + per-ZIP numbers; the cluster tile walk (on demand) gives per-outage crew status.
+  const KUBRA = { base:'https://kubra.io', instance:'4fbb3ad3-e01d-4d71-9575-d453769c1171', view:'8ed2824a-bd92-474e-a7c4-848b812b7f9b' };
+  const kubra = { ok:false, err:null, state:null, summary:null, zips:null, outages:null, walking:false, layer:null, show:true };
+  async function kj(url){ const r = await fetch(url); if(r.status===404) return null; if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }
+  async function loadKubra(){
+    try {
+      const st = await kj(`${KUBRA.base}/stormcenter/api/v1/stormcenters/${KUBRA.instance}/views/${KUBRA.view}/currentState?preview=false`);
+      const slug = st.data.interval_generation_data;
+      const [sum, th] = await Promise.all([
+        kj(`${KUBRA.base}/${slug}/public/summary-1/data.json`),
+        kj(`${KUBRA.base}/${slug}/public/thematic-2/thematic_areas.json`).catch(()=>null),
+      ]);
+      kubra.state = st; kubra.summary = sum?.summaryFileData || null; kubra.zips = th?.file_data || null;
+      kubra.ok = true; kubra.err = null;
+    } catch(e){ kubra.ok = false; kubra.err = e.message; }
+  }
+  // Google polyline decoding (Kubra geometries)
+  function decodePolyline(str){
+    let i=0, lat=0, lng=0; const out=[];
+    while(i<str.length){
+      for(const which of [0,1]){
+        let res=0, shift=0, b;
+        do { b=str.charCodeAt(i++)-63; res|=(b&0x1f)<<shift; shift+=5; } while(b>=0x20);
+        const d = (res&1) ? ~(res>>1) : (res>>1);
+        if(which===0) lat+=d; else lng+=d;
+      }
+      out.push([lat/1e5, lng/1e5]);
+    }
+    return out;
+  }
+  // slippy tiles → quadkeys
+  function tileXY(lat, lng, z){
+    const n=2**z, x=Math.floor((lng+180)/360*n);
+    const r=lat*Math.PI/180, y=Math.floor((1-Math.log(Math.tan(r)+1/Math.cos(r))/Math.PI)/2*n);
+    return [x,y];
+  }
+  function quadkey(x,y,z){ let q=''; for(let i=z;i>0;i--){ const m=1<<(i-1); q += ((x&m)?1:0) + ((y&m)?2:0); } return q; }
+  async function walkKubra(){
+    if(!kubra.ok || kubra.walking) return;
+    kubra.walking = true; kubra.outages = []; render();
+    try {
+      const st = kubra.state;
+      const cfg = await kj(`${KUBRA.base}/stormcenter/api/v1/stormcenters/${KUBRA.instance}/views/${KUBRA.view}/configuration/${st.stormcenterDeploymentId}?preview=false`);
+      const layer = cfg.config.layers.data.interval_generation_data.find(l => String(l.type).startsWith('CLUSTER_LAYER'));
+      const cslug = st.data.cluster_interval_generation_data;
+      const url = q => `${KUBRA.base}/${cslug.replace('{qkh}', q.slice(-3).split('').reverse().join(''))}/public/${layer.id}/${q}.json`;
+      // DTE service territory bbox (from the ArcGIS iteminfo extent), zoom 7 start, zoom 14 max
+      const Z0=7, ZMAX=14, [x0,y0]=tileXY(44.08,-84.37,Z0), [x1,y1]=tileXY(41.82,-82.41,Z0); // NW corner → SE corner
+      let queue=[]; for(let x=x0;x<=x1;x++) for(let y=y0;y<=y1;y++) queue.push(quadkey(x,y,Z0));
+      let done=0, found=[];
+      const worker = async () => {
+        while(queue.length){
+          const q = queue.shift();
+          let data=null; try { data = await kj(url(q)); } catch(e){}
+          done++;
+          if(data?.file_data){
+            for(const o of data.file_data){
+              if(o.desc?.cluster && q.length < ZMAX){ for(const d of '0123') queue.push(q+d); break; }
+            }
+            if(!data.file_data.some(o=>o.desc?.cluster) || q.length===ZMAX) found.push(...data.file_data);
+          }
+          if(done % 25 === 0) setStatus(`Loading crew status from Kubra… ${found.length} outages, ${queue.length} tiles left`);
+        }
+      };
+      await Promise.all(Array.from({length:6}, worker));
+      // de-dup (same outage can appear in overlapping tiles at max zoom)
+      const seen = new Set();
+      kubra.outages = found.filter(o => { const id = o.desc?.inc_id || ((o.geom?.p?.[0]||'') + '|' + (o.desc?.start_time||'')); if(seen.has(id)) return false; seen.add(id); return true; });
+    } catch(e){ kubra.err = e.message; kubra.outages = null; }
+    kubra.walking = false; render(); tick();
+  }
+  function drawKubra(){
+    if(kubra.layer) kubra.layer.remove();
+    kubra.layer = null;
+    if(!kubra.outages?.length || !kubra.show) return;
+    const g = L.layerGroup();
+    for(const o of kubra.outages){
+      const d=o.desc||{}, cust=d.cust_a?.val ?? 0, custLabel = d.cust_a?.mask ? `fewer than ${d.cust_a.mask}` : fmt(cust);
+      const html = `<b>DTE outage map</b> · ${custLabel} customers${d.cluster?' (cluster of '+d.n_out+')':''}
+        <div class="kv">
+          <span>Crew</span><span>${d.crew_status||'—'}</span>
+          <span>Cause</span><span>${d.cause?.['EN-US']||d.cause||'—'}</span>
+          <span>Started</span><span>${d.start_time ? fmtTime(Date.parse(d.start_time)) : '—'}</span>
+          <span>Est. restore</span><span>${d.etr && d.etr!=='ETR-NULL' ? fmtTime(Date.parse(d.etr)) : (d.comments || '—')}${d.etr_confidence?' · '+d.etr_confidence:''}</span>
+          ${d.comments && d.etr && d.etr!=='ETR-NULL' ? `<span>Note</span><span>${d.comments}</span>` : ''}
+        </div>`;
+      let l;
+      if(o.geom?.a?.length){ l = L.polygon(o.geom.a.map(decodePolyline), {color:'#2563eb', weight:1.5, fill:false, dashArray:'4 3'}); }
+      else if(o.geom?.p?.length){ const pt=decodePolyline(o.geom.p[0])[0]; l = L.circleMarker(pt, {radius:5, color:'#2563eb', weight:1.5, fillColor:'#fff', fillOpacity:.9}); }
+      if(l){ l.bindPopup(html,{maxWidth:320}); g.addLayer(l); }
+    }
+    kubra.layer = g.addTo(map);
+  }
+
   // ---- State ----
   let outages = [], stormModes = [], lastLoad = 0, timer = null, countdown = null;
   let sortKey = 'NUM_CUST', sortDir = -1, centerFilter = 'all', activeId = null;
@@ -197,7 +415,8 @@
     return inside;
   }
   const inPoly = (pt, f) => (f.geometry?.coordinates||[]).some(r => pointInRing(pt, r));
-  const zipCode = f => { const p=f.properties||{}; const k=Object.keys(p).find(k=>/zip/i.test(k)); return k ? String(p[k]) : null; };
+  const zipCode = f => f.properties?.ZIP != null ? String(f.properties.ZIP) : null;
+  const zipName = z => { const f=(zips||[]).find(f => zipCode(f)===String(z)); return f?.properties?.PO_NAME ? `${z} <span style="color:var(--muted)">${f.properties.PO_NAME}</span>` : String(z); };
 
   async function loadZips(){
     if(zips) return;
@@ -221,12 +440,14 @@
                       spatialRel:'esriSpatialRelIntersects', outFields:'*', outSR:4326, returnGeometry:true, geometryPrecision:5 }),
         query(3, { objectIds: Array.from({length:60},(_,i)=>i+1).join(','), outFields:'*', returnGeometry:false }).catch(() => ({features:[]})),
         loadZips(),
+        loadKubra(),
       ]);
       const all = feat.map(toGeo);
       // DTE has intermittently served geometry with no attributes; keep the shapes and say so.
       attrsMissing = all.length > 0 && all.every(f => f.properties.NUM_CUST == null);
       outages = attrsMissing ? all : all.filter(f => f.properties.NUM_CUST > 0);
       stormModes = (modes.features || []).map(f => f.attributes);
+      deriveHierarchy(); runSim(); sim.impliedCrews = impliedCrews();
       lastLoad = Date.now();
       render();
     } catch(e){
@@ -251,6 +472,8 @@
     const custOut = outages.reduce((a,f)=>a+(f.properties.NUM_CUST||0),0);
     const custRestored = outages.reduce((a,f)=>a+(f.properties.NUM_CUST_RESTORED||0),0);
     const dispatched = outages.filter(f => f.properties.DISPATCH_DTTM).length;
+    const byType = {}; for(const f of outages){ const t=tycod(f.properties)||'Outage'; byType[t]=(byType[t]||0)+1; }
+    const typeLine = Object.entries(byType).filter(([t])=>t!=='Outage').map(([t,n])=>`<span>${n}</span> ${t.toLowerCase()}`).join(' · ');
     const byStatus = {};
     for(const f of outages){ const s=statusName(f.properties.EVENT_STATUS); byStatus[s]=(byStatus[s]||0)+1; }
     const statusLine = Object.entries(byStatus).sort((a,b)=>b[1]-a[1]).map(([s,n])=>`<span>${n}</span> ${s.toLowerCase()}`).join(' · ');
@@ -262,7 +485,7 @@
       (byCenter[c] ||= {cust:0, n:0, storm:false, affected:0, restored:0});
       byCenter[c].cust += p.NUM_CUST||0; byCenter[c].n++;
       byCenter[c].affected += p.TOAL_CUST_AFFECTED||p.NUM_CUST||0; byCenter[c].restored += p.NUM_CUST_RESTORED||0;
-      if(/y|on|true|1/i.test(String(p.STORM_MODE||''))) byCenter[c].storm = true;
+      if(String(p.STORM_MODE||'').toUpperCase()==='STORM') byCenter[c].storm = true;
     }
     // what broke
     const byDev = {};
@@ -281,13 +504,11 @@
     const zipRows = Object.entries(byZip).sort((a,b)=>b[1].cust-a[1].cust).slice(0,10);
     const maxZip = Math.max(1, ...zipRows.map(z=>z[1].cust));
     // storm-mode table (field names unknown ahead of time; match loosely)
+    // Table 3 (SERVICE_CENTER / STORM_MODE / LAST_UPDATED) was last updated in 2019 when checked; only trust it if fresh.
     for(const row of stormModes){
-      const nameKey = Object.keys(row).find(k => /center|name/i.test(k));
-      const modeKey = Object.keys(row).find(k => /mode|storm/i.test(k) && k !== nameKey);
-      if(!nameKey || !modeKey) continue;
-      const name = row[nameKey]; const v = String(row[modeKey] ?? '');
-      (byCenter[name] ||= {cust:0,n:0,storm:false,affected:0,restored:0});
-      if(/y|on|true|1|storm/i.test(v) && !/normal|off|n$/i.test(v)) byCenter[name].storm = true;
+      if(!row.SERVICE_CENTER || !(row.LAST_UPDATED > Date.now() - 7*864e5)) continue;
+      (byCenter[row.SERVICE_CENTER] ||= {cust:0,n:0,storm:false,affected:0,restored:0});
+      if(String(row.STORM_MODE||'').toUpperCase()==='STORM') byCenter[row.SERVICE_CENTER].storm = true;
     }
     const centers = Object.entries(byCenter).sort((a,b)=>b[1].cust-a[1].cust);
     const maxCust = Math.max(1, ...centers.map(c=>c[1].cust));
@@ -302,15 +523,41 @@
         <div class="big">${attrsMissing ? '—' : fmt(custOut)}<small>customers out</small></div>
         ${attrsMissing ? `<div class="sub" style="color:#9a1c1c">DTE is currently serving outage shapes without details. Showing locations only.</div>` : `
         <div class="sub"><span>${fmt(outages.length)}</span> active outages · <span>${fmt(custRestored)}</span> restored on open jobs · <span>${dispatched}</span> with crews dispatched</div>
-        <div class="sub">${statusLine}</div>`}
+        <div class="sub">${statusLine}</div>
+        ${typeLine ? `<div class="sub">Also in the feed: ${typeLine} — counted in jobs above, usually 1 customer each</div>` : ''}`}
+        ${kubra.summary ? (() => { const t=kubra.summary.totals?.[0]||{}; const off=t.total_cust_a?.val; const mode=kubra.summary.page_mode?.mode; return `
+        <div class="sub" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--line)">DTE's public map: <span>${fmt(off)}</span> out (${t.total_percent_cust_a?.val ?? '—'}% of ${fmt(t.total_cust_s)}) · <span>${fmt(t.total_outages)}</span> outages${mode ? ` · ${mode==='BLUESKY' ? 'normal mode' : mode.toLowerCase()+' mode'}` : ''}${kubra.summary.overwritten_etr ? ' · <span style="color:var(--storm)">ETRs overridden system-wide</span>' : ''}${off!=null && !attrsMissing && Math.abs(off-custOut) > Math.max(500, custOut*.05) ? `<br><span style="color:var(--muted)">Job feed sums to ${fmt(custOut)}; it counts circuit-level and device-level jobs separately, so nested jobs can double-count</span>` : ''}</div>` })() : kubra.err ? `<div class="sub" style="margin-top:8px;color:var(--muted)">DTE's public map data unavailable (${kubra.err})</div>` : ''}
       </div>
+      <section>
+        <h2>DTE's public map detail</h2>
+        ${!kubra.ok ? `<div style="color:var(--muted)">DTE's public map feed didn't load.</div>`
+          : kubra.walking ? `<div style="color:var(--muted)">Loading… walks the map tiles; about 30 seconds during a big storm.</div>`
+          : !kubra.outages ? `<div style="color:var(--muted)">Per-outage cause, day-level restoration estimate, and crew status if DTE publishes it.</div><button type="button" id="walkBtn" style="margin-top:8px;font:inherit;font-size:13px;padding:5px 10px;border:1px solid var(--line);border-radius:6px;background:#fff;cursor:pointer">Load outage detail</button>`
+          : (() => {
+              const tally = f => { const by={}; for(const o of kubra.outages){ const k=f(o.desc||{}); const n=o.desc?.cust_a?.val ?? 0; (by[k] ||= {n:0,cust:0}); by[k].n++; by[k].cust+=n; } return Object.entries(by).sort((a,b)=>b[1].cust-a[1].cust); };
+              const row = ([k,v]) => `<div class="center" style="grid-template-columns:1fr auto"><div class="name">${k}</div><div class="n">${fmt(v.cust)} · ${v.n}</div></div>`;
+              const crews = tally(d => d.crew_status || (d.crew_icon ? 'Crew assigned' : 'Not published'));
+              const crewsPublished = crews.some(([k]) => k !== 'Not published');
+              const etrs = tally(d => d.etr && d.etr!=='ETR-NULL' ? 'Specific time given' : (d.comments || 'No estimate'));
+              const causes = tally(d => d.cause?.['EN-US'] || 'Not yet determined');
+              const total = kubra.outages.reduce((a,o)=>a+(o.desc?.cust_a?.val ?? 0),0);
+              return `
+            <div class="meta" style="color:var(--muted);font-size:12px;margin-bottom:8px">${kubra.outages.length} outages · ${fmt(total)} customers (counts under 5 are masked by DTE)</div>
+            <div style="font-size:13px;font-weight:500;margin:6px 0 4px">Crew status</div>
+            ${crewsPublished ? `<div class="centers">${crews.map(row).join('')}</div>` : `<div style="color:var(--muted);font-size:13px">Not published for any outage right now.</div>`}
+            <div style="font-size:13px;font-weight:500;margin:10px 0 4px">Restoration estimate</div>
+            <div class="centers">${etrs.slice(0,6).map(row).join('')}</div>
+            <div style="font-size:13px;font-weight:500;margin:10px 0 4px">Cause</div>
+            <div class="centers">${causes.slice(0,8).map(row).join('')}</div>
+            <label style="display:flex;gap:6px;align-items:center;margin-top:10px;color:var(--muted);font-size:13px"><input type="checkbox" id="kubraShow" ${kubra.show?'checked':''}> Show on map (blue)</label>`; })()}
+      </section>
       <section>
         <h2>Within ${NEAR_MILES} miles of you${near ? ` · ${near.length} outage${near.length===1?'':'s'}` : ''}</h2>
         ${!near ? `<div style="color:var(--muted)">Allow location access, or use "Center on me" above.</div>`
           : near.length===0 ? `<div style="color:var(--muted)">No outages reported near you.</div>`
           : `<table><tbody>${near.slice(0,8).map(({f,d}) => { const p=f.properties; return `
             <tr class="row" tabindex="0" data-id="${p.OBJECTID}">
-              <td><span class="swatch" style="background:${color(p.NUM_CUST)}"></span>${p.JOB_ID||'—'}<div class="meta">${p.CAUSE||'Cause pending'} · est. ${fmtTime(etr(p))}</div></td>
+              <td><span class="swatch" style="background:${color(p.NUM_CUST)}"></span>${p.JOB_ID||'—'}<div class="meta">${p.CAUSE||'Cause pending'} · wave ${p._wave||'–'} · DTE ${fmtTime(p._effEtr||etr(p))}${p._blocked?' <span style="color:var(--storm)">▲</span>':''}${p._wave?' · model '+fmtTime(p._simEtr):''}</div></td>
               <td class="num">${fmt(p.NUM_CUST)}<div class="meta">${d.toFixed(1)} mi</div></td>
             </tr>`; }).join('')}</tbody></table>`}
       </section>
@@ -319,40 +566,80 @@
         <div class="centers">
           ${centers.map(([name,c]) => { const pct = c.affected ? c.restored/c.affected*100 : 0; return `
             <div class="center">
-              <div class="name"><span class="dot ${c.storm?'storm':''}" title="${c.storm?'Storm mode':'Normal'}"></span>${name}</div>
+              <div class="name"><span class="dot ${c.storm?'storm':''}" title="${c.storm?'Storm mode':'Normal'}"></span>${centerName(name)}</div>
               <div class="n">${fmt(c.cust)} out · ${c.n} jobs${c.restored ? ` · ${pct.toFixed(0)}% restored` : ''}</div>
               <div class="bar" title="${fmt(c.restored)} of ${fmt(c.affected)} affected customers restored on open jobs"><i style="width:${(c.cust/maxCust*100).toFixed(1)}%"></i></div>
             </div>`; }).join('')}
         </div>
       </section>
       <section>
+        <h2>Restoration model</h2>
+        <div style="color:var(--muted);font-size:12px;margin:-4px 0 10px">A crew-capacity simulation, not DTE's plan: jobs are worked upstream-first (or by customers per crew-hour), each tier has an assumed median repair time, and a job's customers come back only when everything upstream is also done. DTE additionally prioritizes hospitals, water plants, and similar.</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 12px;font-size:13px;margin-bottom:10px">
+          <label>Crews<br><input id="simCrews" type="number" min="100" max="10000" step="100" value="${sim.crews}" style="width:100%;font:inherit;padding:4px 6px;border:1px solid var(--line);border-radius:6px"></label>
+          <label title="Share of the quoted headcount actually clearing outages at any moment. DTE's storm counts include tree crews, assessors, wire guards, and crews still en route.">Share clearing outages<br><input id="simEff" type="number" min="0.1" max="1" step="0.05" value="${sim.efficiency}" style="width:100%;font:inherit;padding:4px 6px;border:1px solid var(--line);border-radius:6px"></label>
+          <label style="grid-column:1/-1">Dispatch priority<br><select id="simPri" style="width:100%"><option value="waves" ${sim.priority==='waves'?'selected':''}>Upstream first, biggest jobs first within a tier</option><option value="cph" ${sim.priority==='cph'?'selected':''}>Most customers per crew-hour</option></select></label>
+        </div>
+        ${sim.horizonH != null ? `<div class="sub" style="margin-bottom:4px">Model: all customers back in about <span>${sim.horizonH < 48 ? Math.round(sim.horizonH)+' hours' : (sim.horizonH/24).toFixed(1)+' days'}</span> · ${fmt(Math.round(sim.crews*sim.efficiency))} effective crews${sim.impliedCrews ? ` · <span title="Effective crews that would make this model land on DTE's latest estimate">DTE's estimates imply ~${fmt(sim.impliedCrews)}</span>` : ''} · half restored by <span>${(() => { const pts=outages.map(f=>f.properties).filter(p=>p._wave!==0&&p._simEtr).sort((a,b)=>a._simEtr-b._simEtr); const tot=pts.reduce((a,p)=>a+(p.NUM_CUST||0),0); let acc=0; for(const p of pts){ acc+=p.NUM_CUST||0; if(acc>=tot/2) return fmtTime(p._simEtr); } return '—'; })()}</span></div>${restoreCurve()}` : ''}
+        <details style="font-size:12px;color:var(--muted);margin:6px 0 10px"><summary style="cursor:pointer">Assumed repair times</summary>
+          <div style="display:grid;grid-template-columns:auto auto 1fr;gap:2px 10px;margin-top:6px">${Object.entries(REPAIR).map(([k,r]) => `<span>${k}</span><span>${r.hours}h × ${r.crews}</span><span>${r.why}</span>`).join('')}<span>+ travel/assess</span><span>${TRAVEL_H}h</span><span>every job; in-progress jobs assumed half done</span></div>
+        </details>
+        ${(() => { const rows = [0,1,2,3,4,5,6].map(n => { const js = outages.filter(f=>f.properties._wave===n); if(!js.length) return null;
+            const cust = js.reduce((a,f)=>a+(f.properties.NUM_CUST||0),0), blocked = js.filter(f=>f.properties._blocked).length;
+            const ets = js.map(f=>f.properties._effEtr).filter(Boolean).sort((a,b)=>a-b); const med = ets.length ? ets[Math.floor(ets.length/2)] : null; const last = ets.length ? ets[ets.length-1] : null;
+            const sms = js.map(f=>f.properties._simEtr).filter(Boolean).sort((a,b)=>a-b); const smed = sms.length ? sms[Math.floor(sms.length/2)] : null, slast = sms.length ? sms[sms.length-1] : null;
+            return {n, cust, jobs:js.length, blocked, med, last, smed, slast}; }).filter(Boolean);
+          const mx = Math.max(1, ...rows.map(r=>r.cust));
+          return `<div class="centers">${rows.map(r => `
+            <div class="center">
+              <div class="name">${r.n ? `<span style="color:var(--muted);width:14px;display:inline-block">${r.n}</span>` : `<span style="color:var(--muted);width:14px;display:inline-block">–</span>`}${waveName(r.n)}</div>
+              <div class="n">${fmt(r.cust)} · ${r.jobs} jobs</div>
+              ${r.n ? `<div style="grid-column:1/-1;color:var(--muted);font-size:12px;margin-top:-2px;line-height:1.4">Model: typical ${fmtTime(r.smed)} · last ${fmtTime(r.slast)}<br>DTE: typical ${fmtTime(r.med)} · last ${fmtTime(r.last)}${r.blocked ? ` · ${r.blocked} blocked upstream` : ''}</div>` : ''}
+              ${r.n ? `<div class="bar"><i style="width:${(r.cust/mx*100).toFixed(1)}%"></i></div>` : ''}
+            </div>`).join('')}</div>`; })()}
+      </section>
+      <section>
         <h2>What failed</h2>
+        <div style="color:var(--muted);font-size:12px;margin:-4px 0 10px">Ordered by customers out. Higher tiers sit further upstream, so one job takes out more of the network.</div>
         <div class="centers">
-          ${devs.slice(0,8).map(([name,d]) => `
+          ${devs.slice(0,9).map(([name,d]) => `
             <div class="center" style="grid-template-columns:1fr auto">
               <div class="name">${name}</div>
               <div class="n">${fmt(d.cust)} · ${d.n} jobs</div>
+              ${DEV_DESC[name] ? `<div style="grid-column:1/-1;color:var(--muted);font-size:12px;line-height:1.35;margin-top:-2px">${DEV_DESC[name]}</div>` : ''}
             </div>`).join('')}
         </div>
       </section>
+      ${kubra.zips?.length ? (() => { const rows=kubra.zips.map(z=>({zip:z.title, n:z.desc?.n_out??0, out:z.desc?.cust_a?.val??0, served:z.desc?.cust_s??0, pct:z.desc?.percent_cust_a?.val??0})).filter(r=>r.out>0).sort((a,b)=>b.out-a.out).slice(0,12); const mx=Math.max(1,...rows.map(r=>r.out)); return `
+      <section>
+        <h2>By ZIP code · DTE's public map</h2>
+        <div class="centers">
+          ${rows.map(r => `
+            <div class="center zip" tabindex="0" data-zip="${r.zip}" style="cursor:pointer">
+              <div class="name">${zipName(r.zip)}</div>
+              <div class="n">${fmt(r.out)} of ${fmt(r.served)} · ${r.pct}% · ${r.n} outages</div>
+              <div class="bar"><i style="width:${(r.out/mx*100).toFixed(1)}%"></i></div>
+            </div>`).join('')}
+        </div>
+      </section>`; })() : `
       <section>
         <h2>By ZIP code${zips === null ? '' : zips.length === 0 ? ' · boundaries unavailable' : ''}</h2>
         ${zipRows.length === 0 ? `<div style="color:var(--muted)">${zips?.length ? 'No outages mapped to a ZIP.' : 'ZIP boundaries didn\'t load.'}</div>` : `
         <div class="centers">
           ${zipRows.map(([z,c]) => `
             <div class="center zip" tabindex="0" data-zip="${z}" style="cursor:pointer">
-              <div class="name">${z}</div>
+              <div class="name">${zipName(z)}</div>
               <div class="n">${fmt(c.cust)} out · ${c.n} jobs</div>
               <div class="bar"><i style="width:${(c.cust/maxZip*100).toFixed(1)}%"></i></div>
             </div>`).join('')}
         </div>`}
-      </section>
+      </section>`}
       <section>
         <div class="controls">
           <h2 style="margin:0">Outages</h2>
           <select id="centerSel" aria-label="Filter by service center" style="margin-left:auto">
             <option value="all">All centers</option>
-            ${centers.map(([n]) => `<option value="${n}" ${n===centerFilter?'selected':''}>${n}</option>`).join('')}
+            ${centers.map(([n]) => `<option value="${n}" ${n===centerFilter?'selected':''}>${CENTER_NAMES[n] ? CENTER_NAMES[n]+' ('+n+')' : n}</option>`).join('')}
           </select>
         </div>
         <table>
@@ -360,7 +647,8 @@
             <th data-k="JOB_ID">Job</th>
             <th data-k="NUM_CUST" class="num">Out</th>
             <th data-k="OFF_DTTM" class="num">Since</th>
-            <th data-k="EST_REP_DTTM" class="num">Est. restore</th>
+            <th data-k="_effEtr" class="num" title="DTE's estimate, pushed later if an upstream job's estimate is later">DTE est.</th>
+            <th data-k="_simEtr" class="num" title="Crew-capacity model">Model</th>
           </tr></thead>
           <tbody id="rows"></tbody>
         </table>
@@ -370,28 +658,34 @@
       const k = th.dataset.k; if(sortKey===k) sortDir*=-1; else { sortKey=k; sortDir = k==='JOB_ID'?1:-1; }
       renderRows();
     });
+    const resim = () => { sim.crews = +rail.querySelector('#simCrews').value || sim.crews; sim.efficiency = Math.min(1, Math.max(.1, +rail.querySelector('#simEff').value || sim.efficiency)); sim.priority = rail.querySelector('#simPri').value; runSim(); render(); };
+    ['#simCrews','#simEff','#simPri'].forEach(sel => rail.querySelector(sel)?.addEventListener('change', resim));
+    rail.querySelector('#walkBtn')?.addEventListener('click', walkKubra);
+    rail.querySelector('#kubraShow')?.addEventListener('change', e => { kubra.show = e.target.checked; drawKubra(); });
+    drawKubra();
     rail.querySelectorAll('.zip').forEach(el => {
-      const go = () => { const z = zips.find(f => zipCode(f)===el.dataset.zip); if(z){ map.fitBounds(L.geoJSON(z).getBounds()); } };
+      const go = () => { const z = (zips||[]).find(f => zipCode(f)===el.dataset.zip); if(z){ map.fitBounds(L.geoJSON(z).getBounds()); } };
       el.onclick = go; el.onkeydown = e => { if(e.key==='Enter'||e.key===' ') { e.preventDefault(); go(); } };
     });
     renderRows(); drawMap();
-    if(outages.length===0) rail.querySelector('#rows').innerHTML = `<tr><td colspan="4" class="empty">No active outages reported.</td></tr>`;
+    if(outages.length===0) rail.querySelector('#rows').innerHTML = `<tr><td colspan="5" class="empty">No active outages reported.</td></tr>`;
   }
 
   const visible = () => outages.filter(f => centerFilter==='all' || (f.properties.SERVICE_CENTER||'Unknown')===centerFilter);
 
   function renderRows(){
     const rows = visible().sort((a,b) => {
-      const x=sortKey==='EST_REP_DTTM'?etr(a.properties):a.properties[sortKey], y=sortKey==='EST_REP_DTTM'?etr(b.properties):b.properties[sortKey];
+      const x=a.properties[sortKey], y=b.properties[sortKey];
       return (x==null)-(y==null) || (x>y?1:x<y?-1:0)*sortDir;
     });
     document.getElementById('rows').innerHTML = rows.slice(0,300).map(f => { const p=f.properties; return `
       <tr class="row ${p.OBJECTID===activeId?'active':''}" tabindex="0" data-id="${p.OBJECTID}">
-        <td><span class="swatch" style="background:${color(p.NUM_CUST)}"></span>${p.JOB_ID||'—'}<div class="meta">${p.CAUSE||'Cause pending'} · ${statusName(p.EVENT_STATUS)}${p.DISPATCH_DTTM?' · crew dispatched':''}${p._zip?' · '+p._zip:''}</div></td>
+        <td><span class="swatch" style="background:${color(p.NUM_CUST)}"></span>${p.JOB_ID||'—'}<div class="meta">${tycod(p) && tycod(p)!=='Outage' ? '<b style="font-weight:500">'+tycod(p)+'</b> · ' : ''}${p.CAUSE||'Cause pending'} · ${statusName(p.EVENT_STATUS)}${p.DISPATCH_DTTM?' · crew dispatched':''}${p._wave ? ' · wave '+p._wave : ''}${p._zip?' · '+p._zip:''}</div></td>
         <td class="num">${fmt(p.NUM_CUST)}</td>
         <td class="num" title="${fmtTime(p.OFF_DTTM)}">${ago(p.OFF_DTTM)}</td>
-        <td class="num">${etrLabel(p)}</td>
-      </tr>`; }).join('') + (rows.length>300 ? `<tr><td colspan="4" class="empty">Showing 300 of ${rows.length}. Filter by service center to see the rest.</td></tr>` : '');
+        <td class="num" title="${p._blocked ? 'Own estimate '+etrLabel(p)+'; waiting on upstream job' : ''}">${p._blocked ? '<span style="color:var(--storm)">▲</span> '+fmtTime(p._effEtr) : etrLabel(p)}</td>
+        <td class="num" style="color:${p._simEtr && p._effEtr && p._simEtr > p._effEtr + 6*3600e3 ? 'var(--storm)' : 'inherit'}">${p._wave===0 ? '—' : fmtTime(p._simEtr)}</td>
+      </tr>`; }).join('') + (rows.length>300 ? `<tr><td colspan="5" class="empty">Showing 300 of ${rows.length}. Filter by service center to see the rest.</td></tr>` : '');
     document.querySelectorAll('tr.row').forEach(tr => {
       const go = () => focusOutage(+tr.dataset.id);
       tr.onclick = go; tr.onkeydown = e => { if(e.key==='Enter'||e.key===' ') { e.preventDefault(); go(); } };
@@ -406,8 +700,12 @@
         <span>Crew dispatched</span><span>${p.DISPATCH_DTTM ? fmtTime(p.DISPATCH_DTTM) : 'Not yet'}</span>
         <span>Off since</span><span>${fmtTime(p.OFF_DTTM)}</span>
         <span>Est. restore</span><span>${fmtTime(p.EST_REP_DTTM)}${p.EST_REP_ENDDTTM?' – '+fmtTime(p.EST_REP_ENDDTTM):''}</span>
+        <span>Restoration wave</span><span>${p._wave ? p._wave+' · '+waveName(p._wave) : waveName(0)}</span>
+        ${p._wave ? `<span>Model</span><span>${fmtTime(p._simEtr)} <span style="color:var(--muted)">(${p._workH.toFixed(1)}h of work${p._crewsNeeded>1?', '+p._crewsNeeded+' crews':''}${p._up?.length ? ', after upstream' : ''})</span></span>` : ''}
+        ${p._up?.length ? `<span>Upstream jobs</span><span>${p._up.map(id => { const u=outages.find(x=>x.properties.OBJECTID===id)?.properties; return u ? `<a href="#" data-focus="${id}" style="color:#2563eb">${u.JOB_ID}</a> <span style="color:var(--muted)">${u.DEV_TYPE_NAME||''} · ${fmt(u.NUM_CUST)} · est. ${fmtTime(etr(u))}</span>` : id; }).join('<br>')}${p._blocked ? `<br><b style="color:var(--storm)">Earliest realistic restore: ${fmtTime(p._effEtr)}</b>` : ''}</span>` : ''}
         <span>Circuit est.</span><span>${fmtTime(p.CIRCUIT_EST_DTTM)}${p.CIRCUIT_EST_ENDDTTM?' – '+fmtTime(p.CIRCUIT_EST_ENDDTTM):''}</span>
-        <span>Device</span><span>${p.DEV_TYPE_NAME||'—'} ${p.DEV_NAME||''}</span>
+        ${tycod(p) && tycod(p)!=='Outage' ? `<span>Type</span><span>${tycod(p)}</span>` : ''}
+        <span>Failed at</span><span>${p.DEV_TYPE_NAME||'Not yet identified'}${DEV_DESC[p.DEV_TYPE_NAME||'Not yet identified'] ? `<br><span style="color:var(--muted)">${DEV_DESC[p.DEV_TYPE_NAME||'Not yet identified']}</span>` : ''}</span>
         <span>Service center</span><span>${p.SERVICE_CENTER||'—'}${p.STORM_MODE?' · storm mode '+p.STORM_MODE:''}</span>
         <span>Progress</span><span>${p.TOAL_CUST_AFFECTED ? Math.round((p.NUM_CUST_RESTORED||0)/p.TOAL_CUST_AFFECTED*100)+'% restored of '+fmt(p.TOAL_CUST_AFFECTED) : '—'}</span>
         ${p._zip ? `<span>ZIP</span><span>${p._zip}</span>` : ''}
@@ -420,7 +718,8 @@
     const feats = visible().filter(f => f.geometry);
     outageLayer = L.geoJSON({type:'FeatureCollection', features:feats}, {
       style: f => ({ color: color(f.properties.NUM_CUST), weight:1.5, fillColor: color(f.properties.NUM_CUST), fillOpacity:.55 }),
-      onEachFeature: (f, l) => { l.bindPopup(popup(f.properties), {maxWidth:320}); layersById.set(f.properties.OBJECTID, l);
+      onEachFeature: (f, l) => { l.bindPopup(popup(f.properties), {maxWidth:340}); layersById.set(f.properties.OBJECTID, l);
+        l.on('popupopen', e => e.popup.getElement().querySelectorAll('[data-focus]').forEach(a => a.onclick = ev => { ev.preventDefault(); focusOutage(+a.dataset.focus); }));
         l.on('click', () => { activeId = f.properties.OBJECTID; renderRows(); }); }
     }).addTo(map);
     if(feats.length && centerFilter!=='all') map.fitBounds(outageLayer.getBounds().pad(.1));
