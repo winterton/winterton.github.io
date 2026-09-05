@@ -175,7 +175,8 @@
     'Not yet identified':   { hours:1,   crews:1, why:'Assess and make safe' },
   };
   const TRAVEL_H = 0.5;                      // drive + assess per job
-  const sim = { crews:2500, efficiency:0.15, priority:'waves', horizonH:null, impliedCrews:null, nightFactor:0.35, nightStart:20, nightEnd:6 };
+  const sim = { crews:2500, efficiency:0.15, priority:'waves', horizonH:null, impliedCrews:null, nightFactor:0.7, nightStart:20, nightEnd:6, scenario:'curve', calibratedCrews:null };  // defaults to the observed-curve calibration when a fit exists
+  // Night factor: observed Sep 4→5 restoration was fastest overnight (circuit switching), so this is deliberately mild; adjust to taste.
   // Night: crews mostly secure wires, patrol, and switch — repairs aloft in tree debris mostly wait for daylight, as do tree crews and assessors.
   const isNight = ms => { const h = new Date(ms).getHours(); return sim.nightStart > sim.nightEnd ? (h >= sim.nightStart || h < sim.nightEnd) : (h >= sim.nightStart && h < sim.nightEnd); };
   // Advance a start time by `hours` of work, with night hours counting at nightFactor. Walks in 15-minute steps.
@@ -235,6 +236,30 @@
     sim.crews=save.c; sim.efficiency=save.e; runSim();
     return Math.round((lo+hi)/2);
   }
+  // Model time (hours from now) until a fraction of currently-out customers is restored
+  function modelTimeToFraction(frac){
+    const now = Date.now(), pts = outages.map(f=>f.properties).filter(p=>p._wave!==0 && p._simEtr).sort((a,b)=>a._simEtr-b._simEtr);
+    const tot = pts.reduce((a,p)=>a+(p.NUM_CUST||0),0); let acc=0;
+    for(const p of pts){ acc += p.NUM_CUST||0; if(acc >= tot*frac) return (p._simEtr - now)/3600e3; }
+    return null;
+  }
+  // Solve for effective crews so the model's time to restore half of current customers equals the observed curve's half-life.
+  function calibrateToCurve(){
+    const f = curve.fit; if(!f) return null;
+    const targetH = f.tail ? (() => { const now=Date.now(), cur=f.pred(now); const t=f.at(f.tail + (cur - f.tail)/2); return t ? (t-now)/3600e3 : null; })() : f.halfLifeH;
+    if(!targetH) return null;
+    const save = {c:sim.crews, e:sim.efficiency};
+    let lo=20, hi=20000;
+    for(let i=0;i<14;i++){ const mid=(lo+hi)/2; sim.crews=mid; sim.efficiency=1; runSim(); const h = modelTimeToFraction(0.5); if(h == null || h > targetH) lo=mid; else hi=mid; }
+    sim.crews=save.c; sim.efficiency=save.e; runSim();
+    return Math.round((lo+hi)/2);
+  }
+  function applyScenario(){
+    if(sim.scenario === 'dte' && sim.impliedCrews){ sim.crews = sim.impliedCrews; sim.efficiency = 1; }
+    else if(sim.scenario === 'curve' && sim.calibratedCrews){ sim.crews = sim.calibratedCrews; sim.efficiency = 1; }
+    else if(sim.scenario !== 'manual'){ sim.scenario = 'manual'; }   // calibration unavailable; fall back honestly
+    runSim();
+  }
   // customers-restored-over-time curve as a small SVG
   function restoreCurve(){
     const now=Date.now(), pts = outages.map(f=>f.properties).filter(p=>p._wave!==0 && p._simEtr).map(p=>[p._simEtr, p.NUM_CUST||0]).sort((a,b)=>a[0]-b[0]);
@@ -245,6 +270,95 @@
     for(let h=step; h<hrs; h+=step) ticks.push(`<line x1="${(h/hrs*W).toFixed(1)}" y1="0" x2="${(h/hrs*W).toFixed(1)}" y2="${H}" stroke="var(--line)"/><text x="${(h/hrs*W+2).toFixed(1)}" y="${H-3}" font-size="9" fill="var(--muted)">${h}h</text>`);
     return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" style="display:block;margin:6px 0 2px" aria-label="Modelled customers restored over time">${ticks.join('')}<path d="${d}" fill="none" stroke="var(--heat3)" stroke-width="1.5"/></svg>`;
   }
+
+  // ---- Observed restoration curve (Duffey & Ha-style exponential decay fit) ----
+  // Series of [ISO time, customers out, outages]. Seeded from The Michigan Daily's hourly Kubra polls for this storm;
+  // extended with kubra-summary-*.json from the snapshot repo and with each live refresh.
+  const SNAPSHOT_REPO = 'winterton/power-outage-snapshots';
+  const SERIES_SEED = [["2026-09-02T17:53:08Z", 431, 64], ["2026-09-02T20:52:32Z", 1324, 96], ["2026-09-02T23:03:37Z", 4956, 137], ["2026-09-03T01:12:40Z", 3798, 178], ["2026-09-03T06:13:09Z", 63659, 1031], ["2026-09-03T11:23:09Z", 87893, 1730], ["2026-09-03T15:53:02Z", 102331, 2526], ["2026-09-03T19:03:13Z", 107253, 2376], ["2026-09-03T21:43:14Z", 282309, 4880], ["2026-09-03T23:45:16Z", 324585, 4959], ["2026-09-04T03:14:00Z", 258748, 4733], ["2026-09-04T08:03:02Z", 237086, 4492], ["2026-09-04T12:43:19Z", 241567, 4661], ["2026-09-04T16:43:58Z", 261961, 4961], ["2026-09-04T19:13:11Z", 238492, 5494], ["2026-09-04T21:32:57Z", 223880, 4763], ["2026-09-04T23:43:02Z", 191427, 4503], ["2026-09-05T03:12:38Z", 118400, 4157], ["2026-09-05T07:42:30Z", 96148, 3829], ["2026-09-05T11:32:44Z", 95199, 3739], ["2026-09-05T14:33:15Z", 95997, 3875], ["2026-09-05T17:03:04Z", 91847, 3629]];
+  const series = SERIES_SEED.map(([t,c,o]) => ({t:Date.parse(t), c, o}));
+  const curve = { fit:null, err:null, loadedRepo:false };
+  // DTE's public commitments. Each: when it was said, cumulative restored claimed at that time, and the promises.
+  // "Total affected" is restored-so-far + customers out at the time of the statement (cumulative, so double-counts re-outages).
+  const STATEMENTS_KEY = 'dte-statements-v1';
+  const DEFAULT_STATEMENTS = [
+    { id:'seed-1', saidAt:'2026-09-05T11:00:00Z', restoredSoFar:388000, source:'DTE statement, Saturday morning',
+      promises:[ { by:'2026-09-06T03:59:00Z', fraction:0.90, label:'90% restored by end of Saturday' },
+                 { by:'2026-09-07T03:59:00Z', fraction:1.00, label:'Remainder restored by end of Sunday' } ] },
+  ];
+  let DTE_STATEMENTS = DEFAULT_STATEMENTS;
+  try { const saved = JSON.parse(localStorage.getItem(STATEMENTS_KEY)); if(Array.isArray(saved)) DTE_STATEMENTS = saved; } catch(e){}
+  function saveStatements(){ try { localStorage.setItem(STATEMENTS_KEY, JSON.stringify(DTE_STATEMENTS)); } catch(e){} }
+  const toLocalInput = ms => { const d = new Date(ms); const pad = n => String(n).padStart(2,'0'); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+  function commitments(){
+    const out = [];
+    for(const st of DTE_STATEMENTS){
+      const said = Date.parse(st.saidAt); const near = series.reduce((b,p) => Math.abs(p.t-said) < Math.abs(b.t-said) ? p : b, series[0]);
+      const total = st.restoredSoFar + near.c;
+      for(const pr of st.promises){
+        const by = Date.parse(pr.by), maxOut = Math.round(total*(1-pr.fraction));
+        const now = Date.now(), f = curve.fit, proj = f && by > now ? Math.round(f.pred(by)) : null;
+        const actual = by <= now ? series.reduce((b,p) => Math.abs(p.t-by) < Math.abs(b.t-by) ? p : b, series[0]) : null;
+        out.push({ ...pr, by, total, maxOut, proj, actual, source: st.source, stId: st.id,
+          verdict: actual ? (actual.c <= maxOut ? 'met' : 'missed') : proj == null ? null : proj <= maxOut*1.05 ? 'on track' : proj <= maxOut*1.5 ? 'behind' : 'unlikely' });
+      }
+    }
+    return out;
+  }
+  function addPoint(t, c, o){ if(!t || c==null) return; if(series.some(p => Math.abs(p.t - t) < 5*60e3)) return; series.push({t,c,o}); series.sort((a,b)=>a.t-b.t); }
+  async function loadRepoSeries(){
+    if(curve.loadedRepo) return; curve.loadedRepo = true;
+    try {
+      const days = [0,1,2].map(d => { const x = new Date(Date.now() - d*864e5); return `${x.getUTCFullYear()}/${String(x.getUTCMonth()+1).padStart(2,'0')}/${String(x.getUTCDate()).padStart(2,'0')}`; });
+      for(const day of days){
+        const r = await fetch(`https://api.github.com/repos/${SNAPSHOT_REPO}/contents/data/${day}`);
+        if(!r.ok) continue;                                   // 404 = no folder yet; 403 = rate limited, skip quietly
+        const files = (await r.json()).filter(f => /^kubra-summary-.*\.json$/.test(f.name)).slice(-120);
+        await Promise.all(files.map(async f => {
+          try { const d = (await (await fetch(f.download_url)).json()).summaryFileData; const t = d.totals?.[0]; addPoint(Date.parse(d.date_generated), t?.total_cust_a?.val, t?.total_outages); } catch(e){}
+        }));
+      }
+    } catch(e){ curve.err = e.message; }
+  }
+  // Fit N(t) = tail + A·e^(−k t) from the most recent peak in the last 48h, grid-searching the tail.
+  function fitCurve(){
+    const now = Date.now(), recent = series.filter(p => p.t > now - 72*3600e3);
+    if(recent.length < 4) { curve.fit = null; return; }
+    // start at the most recent local peak (a second storm wave restarts the decay) that still leaves 4+ points to fit
+    let i0 = -1;
+    for(let i = recent.length - 4; i >= 1; i--){ if(recent[i].c > recent[i-1].c && recent[i].c >= recent[i+1].c){ i0 = i; break; } }
+    if(i0 < 0){ i0 = 0; for(let i=0;i<recent.length-3;i++) if(recent[i].c >= recent[i0].c) i0 = i; }
+    const seg = recent.slice(i0); if(seg.length < 4) { curve.fit = null; return; }
+    const t0 = seg[0].t; let best = null;
+    for(let tail = 0; tail < seg[seg.length-1].c; tail += Math.max(250, Math.round(seg[0].c/200))){
+      const xs = seg.map(p => (p.t - t0)/3600e3), ys = seg.map(p => Math.log(p.c - tail)); if(ys.some(y => !isFinite(y))) break;
+      const n = xs.length, mx = xs.reduce((a,b)=>a+b)/n, my = ys.reduce((a,b)=>a+b)/n;
+      const sxx = xs.reduce((a,x)=>a+(x-mx)**2,0); if(!sxx) continue;
+      const k = -xs.reduce((a,x,i)=>a+(x-mx)*(ys[i]-my),0)/sxx, a = my + k*mx;
+      const sse = xs.reduce((s,x,i)=>s+(ys[i]-(a-k*x))**2,0);
+      if(k > 0 && (!best || sse < best.sse)) best = {sse, tail, k, A:Math.exp(a), t0};
+    }
+    if(!best) { curve.fit = null; return; }
+    best.halfLifeH = Math.LN2/best.k; best.peak = seg[0].c; best.n = seg.length;
+    best.at = c => c > best.tail ? best.t0 + (Math.log(best.A) - Math.log(c - best.tail))/best.k*3600e3 : null;   // time when N(t) = c
+    best.pred = t => best.tail + best.A*Math.exp(-best.k*(t - best.t0)/3600e3);
+    curve.fit = best;
+  }
+  function curveSvg(){
+    const f = curve.fit, W=300, H=70; if(!f) return '';
+    const now = Date.now(), tMin = f.t0 - 6*3600e3, end = Math.max(now + 12*3600e3, f.at(Math.max(f.tail+1, f.peak*0.05)) || now + 48*3600e3);
+    const pts = series.filter(p => p.t >= tMin), maxC = Math.max(...pts.map(p=>p.c), f.peak);
+    const X = t => ((t - tMin)/(end - tMin)*W).toFixed(1), Y = c => (H - c/maxC*(H-8) - 2).toFixed(1);
+    let d = ''; for(let t = f.t0; t <= end; t += (end - f.t0)/60) d += (d?' L':'M') + X(t) + ',' + Y(f.pred(t));
+    const days = []; for(let t = new Date(tMin).setHours(0,0,0,0); t < end; t += 864e5) if(t > tMin) days.push(`<line x1="${X(t)}" y1="0" x2="${X(t)}" y2="${H}" stroke="var(--line)"/><text x="${+X(t)+2}" y="9" font-size="9" fill="var(--muted)">${new Date(t).toLocaleDateString('en-US',{weekday:'short'})}</text>`);
+    return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" style="display:block;margin:6px 0 2px" aria-label="Observed customers out and fitted curve">
+      ${days.join('')}
+      <line x1="${X(now)}" y1="0" x2="${X(now)}" y2="${H}" stroke="var(--muted)" stroke-dasharray="2 2"/>
+      <path d="${d}" fill="none" stroke="var(--heat3)" stroke-width="1.5" stroke-dasharray="3 2"/>
+      ${pts.map(p => `<circle cx="${X(p.t)}" cy="${Y(p.c)}" r="2" fill="var(--ink)"/>`).join('')}
+    </svg>`;
+  }
+
   const CENTER_NAMES = { RFD:'Redford', PON:'Pontiac', HWL:'Howell', ANN:'Ann Arbor', CAN:'Caniff (Detroit)', MAR:'Marysville', NPT:'Newport', SBY:'Shelby', LAP:'Lapeer', WWS:'Western Wayne', MTC:'Mt. Clemens', NAE:'Northeast (Detroit)' };
   const centerName = c => CENTER_NAMES[c] ? `${CENTER_NAMES[c]} <span style="color:var(--muted)">${c}</span>` : c;
   const etrLabel = p => p.EST_REP_DTTM ? fmtTime(p.EST_REP_DTTM) : p.CIRCUIT_EST_DTTM ? fmtTime(p.CIRCUIT_EST_DTTM)+' (circuit)' : '—';
@@ -470,7 +584,10 @@
       attrsMissing = all.length > 0 && all.every(f => f.properties.NUM_CUST == null);
       outages = attrsMissing ? all : all.filter(f => f.properties.NUM_CUST > 0);
       stormModes = (modes.features || []).map(f => f.attributes);
-      deriveHierarchy(); runSim(); sim.impliedCrews = impliedCrews();
+      if(kubra.summary){ const t=kubra.summary.totals?.[0]; addPoint(Date.parse(kubra.summary.date_generated), t?.total_cust_a?.val, t?.total_outages); }
+      loadRepoSeries().then(() => { fitCurve(); if(outages.length){ sim.calibratedCrews = calibrateToCurve(); applyScenario(); } render(); });
+      fitCurve();
+      deriveHierarchy(); runSim(); sim.impliedCrews = impliedCrews(); sim.calibratedCrews = calibrateToCurve(); applyScenario();
       lastLoad = Date.now();
       render();
     } catch(e){
@@ -596,11 +713,54 @@
         </div>
       </section>
       <section>
+        <h2>Observed restoration curve</h2>
+        ${(() => { const f = curve.fit; if(!f) return `<div style="color:var(--muted);font-size:13px;margin-bottom:12px">Not enough recent points to fit a curve yet.</div>`;
+          const now = Date.now(), last = series[series.length-1];
+          const rates = []; for(let i = Math.max(1, series.length-6); i < series.length; i++){ const a=series[i-1], b=series[i]; const dtH=(b.t-a.t)/3600e3; if(dtH>0.25) rates.push({from:a.t,to:b.t,r:-Math.log(b.c/a.c)/dtH,dc:a.c-b.c}); }
+          const marks = [0.5,0.25,0.1,0.05].map(fr => ({label:`${Math.round(fr*100)}% of peak`, c:Math.round(f.peak*fr), t:f.at(f.peak*fr)})).filter(m => m.t && m.t > now);
+          return `
+          <div style="color:var(--muted);font-size:12px;margin:-4px 0 6px">Customers out, fitted as exponential decay from the last peak (${fmt(f.peak)} at ${fmtTime(f.t0)}), the pattern seen across storm restorations. Dots are observations; the dashed line is the fit and its projection.</div>
+          ${curveSvg()}
+          <div class="sub">Half-life <span>${f.halfLifeH.toFixed(1)} h</span> · ${f.tail ? `settling toward <span>${fmt(f.tail)}</span> still out · ` : ''}${f.n} points · latest <span>${fmt(last.c)}</span> at ${fmtTime(last.t)}</div>
+          <div class="centers" style="margin-top:8px">${marks.map(m => `<div class="center" style="grid-template-columns:1fr auto"><div class="name">${m.label} · ${fmt(m.c)} out</div><div class="n">${fmtTime(m.t)}</div></div>`).join('')}</div>
+          ${(() => { const cs = commitments(); const col = v => v==='met'||v==='on track' ? 'var(--ok)' : v==='missed'||v==='unlikely' ? 'var(--storm)' : v==='behind' ? '#b45309' : 'var(--muted)';
+            const inp = 'font:inherit;font-size:12px;padding:3px 5px;border:1px solid var(--line);border-radius:5px;width:100%';
+            return `
+          <div style="font-size:13px;font-weight:500;margin:12px 0 4px">DTE's public commitments</div>
+          ${cs.length ? `<div class="centers">${cs.map(c => `
+            <div class="center" style="grid-template-columns:1fr auto">
+              <div class="name">${c.label}</div>
+              <div class="n" style="color:${col(c.verdict)}">${c.verdict ? c.verdict.replace(/^\w/, ch => ch.toUpperCase()) : '—'}</div>
+              <div style="grid-column:1/-1;color:var(--muted);font-size:12px;margin-top:-2px">Needs ≤ ${fmt(c.maxOut)} out by ${fmtTime(c.by)} (of ~${fmt(c.total)} affected)${c.actual ? ` · actual ${fmt(c.actual.c)}` : c.proj != null ? ` · curve projects ${fmt(c.proj)}` : ''}</div>
+            </div>`).join('')}</div>` : `<div style="color:var(--muted);font-size:12px">No statements entered.</div>`}
+          <div style="color:var(--muted);font-size:12px;margin-top:6px">${DTE_STATEMENTS.map(st => `<div style="display:flex;gap:8px;align-items:baseline"><span style="flex:1">${st.source || 'Statement'} · ${fmtTime(Date.parse(st.saidAt))} · ${fmt(st.restoredSoFar)} restored so far</span><button type="button" class="rmStmt" data-id="${st.id}" style="font:inherit;font-size:11px;padding:1px 6px;border:1px solid var(--line);border-radius:4px;background:#fff;cursor:pointer;color:var(--muted)">remove</button></div>`).join('')}
+            <div style="margin-top:4px">"Affected" = restored-so-far + customers out when the statement was made; cumulative, so re-outages count twice.</div></div>
+          <details style="font-size:12px;margin:8px 0 4px"><summary style="cursor:pointer;color:var(--muted)">Add a statement</summary>
+            <div id="stmtForm" style="display:grid;grid-template-columns:1fr 1fr;gap:6px 10px;margin-top:8px;font-size:12px">
+              <label>Statement time<br><input id="stSaid" type="datetime-local" value="${toLocalInput(Date.now())}" style="${inp}"></label>
+              <label>Customers restored so far<br><input id="stRestored" type="number" min="0" step="1000" placeholder="e.g. 388000" style="${inp}"></label>
+              <label style="grid-column:1/-1">Source / note<br><input id="stSource" type="text" placeholder="e.g. DTE update, Saturday 4 pm" style="${inp}"></label>
+              <div style="grid-column:1/-1;color:var(--muted)">Promises (leave a row blank to skip)</div>
+              ${[1,2,3].map(i => `<label>Restored by<br><input class="stBy" type="datetime-local" style="${inp}"></label><label>% of affected restored<br><input class="stPct" type="number" min="1" max="100" step="1" placeholder="${i===1?'90':i===2?'100':''}" style="${inp}"></label>`).join('')}
+              <button type="button" id="stAdd" style="grid-column:1/-1;font:inherit;font-size:13px;padding:5px 10px;border:1px solid var(--line);border-radius:6px;background:#fff;cursor:pointer">Add statement</button>
+            </div>
+          </details>`; })()}
+          <details style="font-size:12px;color:var(--muted);margin:8px 0 14px"><summary style="cursor:pointer">Recent restoration rate by interval</summary>
+            <div style="display:grid;grid-template-columns:auto auto 1fr;gap:2px 10px;margin-top:6px">${rates.map(r => `<span>${fmtTime(r.from)} → ${fmtTime(r.to)}</span><span style="color:${r.r>0.06?'var(--ok)':r.r<0.01?'var(--storm)':'inherit'}">${(r.r*100).toFixed(1)}%/h</span><span>${r.dc>=0?'−':'+'}${fmt(Math.abs(r.dc))} customers</span>`).join('')}</div>
+          </details>`; })()}
         <h2>Restoration model</h2>
         <div style="color:var(--muted);font-size:12px;margin:-4px 0 10px">A crew-capacity simulation, not DTE's plan: jobs are worked upstream-first (or by customers per crew-hour), each tier has an assumed median repair time, overnight hours count at reduced throughput, and a job's customers come back only when everything upstream is also done. DTE additionally prioritizes hospitals, water plants, and similar.</div>
+        <label style="display:block;font-size:13px;margin-bottom:10px">Scenario<br>
+          <select id="simScen" style="width:100%">
+            <option value="manual" ${sim.scenario==='manual'?'selected':''}>Manual crew count</option>
+            <option value="dte" ${sim.scenario==='dte'?'selected':''} ${sim.impliedCrews?'':'disabled'}>Calibrated to DTE's estimates${sim.impliedCrews?` (~${fmt(sim.impliedCrews)} effective crews)`:''}</option>
+            <option value="curve" ${sim.scenario==='curve'?'selected':''} ${sim.calibratedCrews?'':'disabled'}>Calibrated to observed curve${sim.calibratedCrews?` (~${fmt(sim.calibratedCrews)} effective crews)`:''}</option>
+          </select></label>
+        ${sim.scenario==='curve' && curve.fit ? `<div style="color:var(--muted);font-size:12px;margin:-4px 0 10px">Crew count solved so the model halves the current outage count in ${curve.fit.halfLifeH.toFixed(1)} h, matching the observed decay. The model then distributes that pace by tier and hierarchy${(() => { const h90 = modelTimeToFraction(0.9), f=curve.fit, now=Date.now(); const c90 = f.at(f.tail + (f.pred(now)-f.tail)*0.1); return h90 && c90 ? ` — it reaches 90% restored ${h90 < (c90-now)/3600e3 ? 'earlier' : 'later'} than the pure curve (${fmtTime(now + h90*3600e3)} vs ${fmtTime(c90)}), the difference being the model's explicit long tail of small jobs.` : '.'; })()}</div>` : ''}
+        ${sim.scenario==='dte' ? `<div style="color:var(--muted);font-size:12px;margin:-4px 0 10px">Crew count solved so the model's last restoration lands on DTE's latest published estimate.</div>` : ''}
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 12px;font-size:13px;margin-bottom:10px">
-          <label>Crews<br><input id="simCrews" type="number" min="100" max="10000" step="100" value="${sim.crews}" style="width:100%;font:inherit;padding:4px 6px;border:1px solid var(--line);border-radius:6px"></label>
-          <label title="Share of the quoted headcount actually clearing outages at any moment. DTE's storm counts include tree crews, assessors, wire guards, and crews still en route.">Share clearing outages<br><input id="simEff" type="number" min="0.1" max="1" step="0.05" value="${sim.efficiency}" style="width:100%;font:inherit;padding:4px 6px;border:1px solid var(--line);border-radius:6px"></label>
+          <label>Crews<br><input id="simCrews" type="number" min="20" max="20000" step="10" value="${Math.round(sim.crews)}" ${sim.scenario!=='manual'?'disabled':''} style="width:100%;font:inherit;padding:4px 6px;border:1px solid var(--line);border-radius:6px"></label>
+          <label title="Share of the quoted headcount actually clearing outages at any moment. DTE's storm counts include tree crews, assessors, wire guards, and crews still en route.">Share clearing outages<br><input id="simEff" type="number" min="0.1" max="1" step="0.05" value="${sim.efficiency}" ${sim.scenario!=='manual'?'disabled':''} style="width:100%;font:inherit;padding:4px 6px;border:1px solid var(--line);border-radius:6px"></label>
           <label title="Repair throughput overnight relative to daytime. Night shifts mainly secure wires, patrol, and switch circuits.">Night throughput (${sim.nightStart}:00–${String(sim.nightEnd).padStart(2,'0')}:00)<br><input id="simNight" type="number" min="0" max="1" step="0.05" value="${sim.nightFactor}" style="width:100%;font:inherit;padding:4px 6px;border:1px solid var(--line);border-radius:6px"></label>
           <label>Dispatch priority<br><select id="simPri" style="width:100%"><option value="waves" ${sim.priority==='waves'?'selected':''}>Upstream first, biggest jobs first within a tier</option><option value="fifo" ${sim.priority==='fifo'?'selected':''}>Upstream first, then oldest outage first</option><option value="cph" ${sim.priority==='cph'?'selected':''}>Most customers per crew-hour</option></select></label>
         </div>
@@ -682,9 +842,24 @@
       const k = th.dataset.k; if(sortKey===k) sortDir*=-1; else { sortKey=k; sortDir = k==='JOB_ID'?1:-1; }
       renderRows();
     });
-    const resim = () => { sim.crews = +rail.querySelector('#simCrews').value || sim.crews; sim.efficiency = Math.min(1, Math.max(.1, +rail.querySelector('#simEff').value || sim.efficiency)); sim.nightFactor = Math.min(1, Math.max(0, +rail.querySelector('#simNight').value)); sim.priority = rail.querySelector('#simPri').value; runSim(); sim.impliedCrews = impliedCrews(); render(); };
-    ['#simCrews','#simEff','#simNight','#simPri'].forEach(sel => rail.querySelector(sel)?.addEventListener('change', resim));
+    const resim = () => {
+      sim.scenario = rail.querySelector('#simScen').value;
+      if(sim.scenario==='manual'){ sim.crews = +rail.querySelector('#simCrews').value || sim.crews; sim.efficiency = Math.min(1, Math.max(.1, +rail.querySelector('#simEff').value || sim.efficiency)); }
+      sim.nightFactor = Math.min(1, Math.max(0, +rail.querySelector('#simNight').value)); sim.priority = rail.querySelector('#simPri').value;
+      runSim(); sim.impliedCrews = impliedCrews(); sim.calibratedCrews = calibrateToCurve(); applyScenario(); render(); };
+    ['#simScen','#simCrews','#simEff','#simNight','#simPri'].forEach(sel => rail.querySelector(sel)?.addEventListener('change', resim));
     rail.querySelector('#walkBtn')?.addEventListener('click', walkKubra);
+    rail.querySelectorAll('.rmStmt').forEach(b => b.onclick = () => { DTE_STATEMENTS = DTE_STATEMENTS.filter(st => st.id !== b.dataset.id); saveStatements(); render(); });
+    rail.querySelector('#stAdd')?.addEventListener('click', () => {
+      const f = rail.querySelector('#stmtForm'); const said = f.querySelector('#stSaid').value, restored = +f.querySelector('#stRestored').value;
+      if(!said || !restored){ f.querySelector('#stRestored').focus(); return; }
+      const bys = [...f.querySelectorAll('.stBy')].map(x=>x.value), pcts = [...f.querySelectorAll('.stPct')].map(x=>+x.value);
+      const promises = bys.map((by,i) => by && pcts[i] ? { by: new Date(by).toISOString(), fraction: pcts[i]/100,
+        label: `${pcts[i]>=100 ? 'Everyone' : pcts[i]+'%'} restored by ${new Date(by).toLocaleString('en-US',{weekday:'short',hour:'numeric',minute:'2-digit'})}` } : null).filter(Boolean);
+      if(!promises.length){ f.querySelector('.stBy').focus(); return; }
+      DTE_STATEMENTS.push({ id:'s'+Date.now(), saidAt:new Date(said).toISOString(), restoredSoFar:restored, source:f.querySelector('#stSource').value || 'DTE statement', promises });
+      saveStatements(); render();
+    });
     rail.querySelector('#kubraShow')?.addEventListener('change', e => { kubra.show = e.target.checked; drawKubra(); });
     drawKubra();
     rail.querySelectorAll('.zip').forEach(el => {
