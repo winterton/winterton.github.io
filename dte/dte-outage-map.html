@@ -56,6 +56,8 @@
   .legend{position:absolute;right:12px;bottom:12px;z-index:800;background:#fff;border:1px solid var(--line);border-radius:6px;padding:10px 12px;font-size:12px}
   .legend div{display:flex;align-items:center;gap:8px;margin:3px 0}
   .legend i{width:14px;height:10px;border-radius:2px;display:inline-block}
+  .leaflet-control-attribution{font-size:9px;color:#9aa3ad;background:rgba(255,255,255,.6);padding:1px 4px}
+  .leaflet-control-attribution a{color:#9aa3ad}
   .leaflet-popup-content{font-family:var(--font);font-size:13px;margin:12px 14px}
   .leaflet-popup-content b{font-weight:600}
   .leaflet-popup-content .kv{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin-top:6px;color:var(--muted)}
@@ -173,7 +175,15 @@
     'Not yet identified':   { hours:1,   crews:1, why:'Assess and make safe' },
   };
   const TRAVEL_H = 0.5;                      // drive + assess per job
-  const sim = { crews:2500, efficiency:0.15, priority:'waves', horizonH:null, impliedCrews:null };
+  const sim = { crews:2500, efficiency:0.15, priority:'waves', horizonH:null, impliedCrews:null, nightFactor:0.35, nightStart:20, nightEnd:6 };
+  // Night: crews mostly secure wires, patrol, and switch — repairs aloft in tree debris mostly wait for daylight, as do tree crews and assessors.
+  const isNight = ms => { const h = new Date(ms).getHours(); return sim.nightStart > sim.nightEnd ? (h >= sim.nightStart || h < sim.nightEnd) : (h >= sim.nightStart && h < sim.nightEnd); };
+  // Advance a start time by `hours` of work, with night hours counting at nightFactor. Walks in 15-minute steps.
+  function addWork(startMs, hours){
+    let t = startMs, remaining = hours; const step = 0.25;
+    while(remaining > 1e-9){ const rate = isNight(t) ? sim.nightFactor : 1; remaining -= step * rate; t += step*3600e3; if(t - startMs > 30*864e5) break; }
+    return t;
+  }
   // efficiency: share of the quoted headcount actually clearing outages at any moment. DTE's storm 'crew' counts include tree crews,
   // damage assessors, wire guards, and mutual-aid crews not yet on site, and storm work runs far slower than bench repair time.
   const repairFor = p => REPAIR[p.DEV_TYPE_NAME || 'Not yet identified'] || REPAIR['Not yet identified'];
@@ -203,7 +213,7 @@
       let picks = [];
       for(let i=0;i<nCrews;i++){ if(picks.length<k){ picks.push(i); picks.sort((x,y)=>free[x]-free[y]); } else if(free[i] < free[picks[k-1]]){ picks[k-1]=i; picks.sort((x,y)=>free[x]-free[y]); } }
       const start = Math.max(now, free[picks[k-1]]);
-      const end = start + p._workH*3600e3;
+      const end = addWork(start, p._workH);
       for(const i of picks) free[i] = end;
       p._simDone = end;
     }
@@ -274,8 +284,19 @@
 
   // ---- Map ----
   const map = L.map('map', { zoomControl:true }).setView([42.45, -83.2], 9);
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
-    attribution:'&copy; OpenStreetMap &copy; CARTO', maxZoom:18 }).addTo(map);
+  map.attributionControl.setPrefix(false);
+  // CARTO began watermarking keyless raster tiles on 28 Aug 2026. Get a free key at carto.com/basemaps/apikey and paste it here.
+  const CARTO_KEY = '';
+  const basemaps = {
+    'Streets': CARTO_KEY
+      ? L.tileLayer(`https://basemaps.cartocdn.com/rastertiles/light_all/{z}/{x}/{y}{r}.png?key=${CARTO_KEY}`, { attribution:'© OpenStreetMap © CARTO', maxZoom:18 })
+      : L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution:'© OpenStreetMap contributors', maxZoom:19 }),
+    // USGS National Map: public domain, no attribution requirement
+    'USGS topo': L.tileLayer('https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{z}/{y}/{x}', { maxZoom:16 }),
+    'USGS imagery': L.tileLayer('https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryTopo/MapServer/tile/{z}/{y}/{x}', { maxZoom:16 }),
+  };
+  basemaps['Streets'].addTo(map);
+  L.control.layers(basemaps, null, { position:'topright', collapsed:true }).addTo(map);
   let outageLayer = null;
   const layersById = new Map();
 
@@ -576,11 +597,12 @@
       </section>
       <section>
         <h2>Restoration model</h2>
-        <div style="color:var(--muted);font-size:12px;margin:-4px 0 10px">A crew-capacity simulation, not DTE's plan: jobs are worked upstream-first (or by customers per crew-hour), each tier has an assumed median repair time, and a job's customers come back only when everything upstream is also done. DTE additionally prioritizes hospitals, water plants, and similar.</div>
+        <div style="color:var(--muted);font-size:12px;margin:-4px 0 10px">A crew-capacity simulation, not DTE's plan: jobs are worked upstream-first (or by customers per crew-hour), each tier has an assumed median repair time, overnight hours count at reduced throughput, and a job's customers come back only when everything upstream is also done. DTE additionally prioritizes hospitals, water plants, and similar.</div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 12px;font-size:13px;margin-bottom:10px">
           <label>Crews<br><input id="simCrews" type="number" min="100" max="10000" step="100" value="${sim.crews}" style="width:100%;font:inherit;padding:4px 6px;border:1px solid var(--line);border-radius:6px"></label>
           <label title="Share of the quoted headcount actually clearing outages at any moment. DTE's storm counts include tree crews, assessors, wire guards, and crews still en route.">Share clearing outages<br><input id="simEff" type="number" min="0.1" max="1" step="0.05" value="${sim.efficiency}" style="width:100%;font:inherit;padding:4px 6px;border:1px solid var(--line);border-radius:6px"></label>
-          <label style="grid-column:1/-1">Dispatch priority<br><select id="simPri" style="width:100%"><option value="waves" ${sim.priority==='waves'?'selected':''}>Upstream first, biggest jobs first within a tier</option><option value="fifo" ${sim.priority==='fifo'?'selected':''}>Upstream first, then oldest outage first</option><option value="cph" ${sim.priority==='cph'?'selected':''}>Most customers per crew-hour</option></select></label>
+          <label title="Repair throughput overnight relative to daytime. Night shifts mainly secure wires, patrol, and switch circuits.">Night throughput (${sim.nightStart}:00–${String(sim.nightEnd).padStart(2,'0')}:00)<br><input id="simNight" type="number" min="0" max="1" step="0.05" value="${sim.nightFactor}" style="width:100%;font:inherit;padding:4px 6px;border:1px solid var(--line);border-radius:6px"></label>
+          <label>Dispatch priority<br><select id="simPri" style="width:100%"><option value="waves" ${sim.priority==='waves'?'selected':''}>Upstream first, biggest jobs first within a tier</option><option value="fifo" ${sim.priority==='fifo'?'selected':''}>Upstream first, then oldest outage first</option><option value="cph" ${sim.priority==='cph'?'selected':''}>Most customers per crew-hour</option></select></label>
         </div>
         ${sim.horizonH != null ? `<div class="sub" style="margin-bottom:4px">Model: all customers back in about <span>${sim.horizonH < 48 ? Math.round(sim.horizonH)+' hours' : (sim.horizonH/24).toFixed(1)+' days'}</span> · ${fmt(Math.round(sim.crews*sim.efficiency))} effective crews${sim.impliedCrews ? ` · <span title="Effective crews that would make this model land on DTE's latest estimate">DTE's estimates imply ~${fmt(sim.impliedCrews)}</span>` : ''} · half restored by <span>${(() => { const pts=outages.map(f=>f.properties).filter(p=>p._wave!==0&&p._simEtr).sort((a,b)=>a._simEtr-b._simEtr); const tot=pts.reduce((a,p)=>a+(p.NUM_CUST||0),0); let acc=0; for(const p of pts){ acc+=p.NUM_CUST||0; if(acc>=tot/2) return fmtTime(p._simEtr); } return '—'; })()}</span></div>${restoreCurve()}` : ''}
         <details style="font-size:12px;color:var(--muted);margin:6px 0 10px"><summary style="cursor:pointer">Assumed repair times</summary>
@@ -660,8 +682,8 @@
       const k = th.dataset.k; if(sortKey===k) sortDir*=-1; else { sortKey=k; sortDir = k==='JOB_ID'?1:-1; }
       renderRows();
     });
-    const resim = () => { sim.crews = +rail.querySelector('#simCrews').value || sim.crews; sim.efficiency = Math.min(1, Math.max(.1, +rail.querySelector('#simEff').value || sim.efficiency)); sim.priority = rail.querySelector('#simPri').value; runSim(); render(); };
-    ['#simCrews','#simEff','#simPri'].forEach(sel => rail.querySelector(sel)?.addEventListener('change', resim));
+    const resim = () => { sim.crews = +rail.querySelector('#simCrews').value || sim.crews; sim.efficiency = Math.min(1, Math.max(.1, +rail.querySelector('#simEff').value || sim.efficiency)); sim.nightFactor = Math.min(1, Math.max(0, +rail.querySelector('#simNight').value)); sim.priority = rail.querySelector('#simPri').value; runSim(); sim.impliedCrews = impliedCrews(); render(); };
+    ['#simCrews','#simEff','#simNight','#simPri'].forEach(sel => rail.querySelector(sel)?.addEventListener('change', resim));
     rail.querySelector('#walkBtn')?.addEventListener('click', walkKubra);
     rail.querySelector('#kubraShow')?.addEventListener('change', e => { kubra.show = e.target.checked; drawKubra(); });
     drawKubra();
